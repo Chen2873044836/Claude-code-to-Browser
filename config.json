@@ -1,0 +1,12 @@
+{
+  "allowed_model_patterns": [
+    "deepseek"
+  ],
+  "default_fetch_chars": 10000,
+  "max_fetch_chars": 60000,
+  "max_search_results": 10,
+  "max_brief_sources": 3,
+  "brief_chars_per_source": 2500,
+  "enable_jina_fallback": true,
+  "jina_min_chars": 300
+}

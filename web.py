@@ -1,0 +1,458 @@
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
+
+import httpx
+from bs4 import BeautifulSoup
+from markdownify import markdownify as html_to_markdown
+
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36 GlobalWebMCP/1.1"
+)
+MAX_DOWNLOAD_BYTES = 5_000_000
+REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+
+
+class FetchSafetyError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    title: str
+    url: str
+    snippet: str
+
+
+@dataclass(frozen=True)
+class GlobalWebConfig:
+    allowed_model_patterns: tuple[str, ...] = ("deepseek",)
+    default_fetch_chars: int = 10_000
+    max_fetch_chars: int = 60_000
+    max_search_results: int = 10
+    max_brief_sources: int = 3
+    brief_chars_per_source: int = 2_500
+    enable_jina_fallback: bool = True
+    jina_min_chars: int = 300
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
+def load_config(path: str | Path | None = None) -> GlobalWebConfig:
+    config_path = Path(path) if path else DEFAULT_CONFIG_PATH
+    raw: dict[str, Any] = {}
+    try:
+        if config_path.exists():
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+
+    patterns = raw.get("allowed_model_patterns", ["deepseek"])
+    if not isinstance(patterns, list):
+        patterns = ["deepseek"]
+    allowed_model_patterns = tuple(
+        str(item).strip().lower() for item in patterns if str(item).strip()
+    ) or ("deepseek",)
+
+    return GlobalWebConfig(
+        allowed_model_patterns=allowed_model_patterns,
+        default_fetch_chars=_bounded_int(raw.get("default_fetch_chars"), 10_000, 1_000, 60_000),
+        max_fetch_chars=_bounded_int(raw.get("max_fetch_chars"), 60_000, 1_000, 120_000),
+        max_search_results=_bounded_int(raw.get("max_search_results"), 10, 1, 20),
+        max_brief_sources=_bounded_int(raw.get("max_brief_sources"), 3, 1, 5),
+        brief_chars_per_source=_bounded_int(raw.get("brief_chars_per_source"), 2_500, 100, 20_000),
+        enable_jina_fallback=bool(raw.get("enable_jina_fallback", True)),
+        jina_min_chars=_bounded_int(raw.get("jina_min_chars"), 300, 0, 5_000),
+    )
+
+
+def config_to_dict(config: GlobalWebConfig) -> dict[str, Any]:
+    return {
+        "allowed_model_patterns": list(config.allowed_model_patterns),
+        "default_fetch_chars": config.default_fetch_chars,
+        "max_fetch_chars": config.max_fetch_chars,
+        "max_search_results": config.max_search_results,
+        "max_brief_sources": config.max_brief_sources,
+        "brief_chars_per_source": config.brief_chars_per_source,
+        "enable_jina_fallback": config.enable_jina_fallback,
+        "jina_min_chars": config.jina_min_chars,
+    }
+
+
+def is_deepseek_model(model: str | None) -> bool:
+    return "deepseek" in (model or "").lower()
+
+
+def model_matches_patterns(model: str | None, patterns: tuple[str, ...] | list[str] | None) -> bool:
+    normalized = (model or "").lower()
+    return any(pattern and pattern.lower() in normalized for pattern in (patterns or ()))
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def validate_fetch_url(url: str) -> str:
+    cleaned = (url or "").strip()
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"}:
+        raise FetchSafetyError("仅允许抓取 http/https URL")
+    if not parsed.netloc:
+        raise FetchSafetyError("URL 缺少主机名")
+    return cleaned
+
+
+def _headers() -> dict[str, str]:
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "identity",
+    }
+
+
+def _duckduckgo_result_url(raw_url: str) -> str:
+    parsed = urlparse(raw_url)
+    if "duckduckgo.com" in parsed.netloc.lower() and parsed.path.startswith("/l/"):
+        query = parse_qs(parsed.query)
+        if query.get("uddg"):
+            return unquote(query["uddg"][0])
+    return raw_url
+
+
+def _clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _clean_multiline(text: str) -> str:
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            lines.append(stripped)
+    return "\n\n".join(lines)
+
+
+def normalize_search_results(html: str, max_results: int = 5) -> list[dict[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[SearchResult] = []
+
+    anchors = soup.select("a.result__a")
+    for anchor in anchors:
+        title = _clean_text(anchor.get_text(" "))
+        href = anchor.get("href") or ""
+        if not title or not href:
+            continue
+
+        snippet = ""
+        parent = anchor.find_parent(class_=re.compile(r"result"))
+        if parent:
+            snippet_node = parent.select_one(".result__snippet")
+            if snippet_node:
+                snippet = _clean_text(snippet_node.get_text(" "))
+
+        if not snippet:
+            next_snippet = anchor.find_next(class_="result__snippet")
+            if next_snippet:
+                snippet = _clean_text(next_snippet.get_text(" "))
+
+        results.append(SearchResult(title=title, url=_duckduckgo_result_url(href), snippet=snippet))
+        if len(results) >= max_results:
+            break
+
+    return [result.__dict__ for result in results]
+
+
+def _best_content_node(soup: BeautifulSoup):
+    for selector in ("main", "article", "[role=main]", ".content", "#content"):
+        node = soup.select_one(selector)
+        if node and _clean_text(node.get_text(" ")):
+            return node
+    return soup.body or soup
+
+
+def extract_markdown(html: str, base_url: str = "", extract_mode: str = "auto") -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for node in soup(["script", "style", "noscript", "template", "svg"]):
+        node.decompose()
+
+    mode = (extract_mode or "auto").lower()
+    if mode == "text":
+        return _clean_multiline(soup.get_text("\n"))
+
+    content_node = soup.body or soup if mode == "body" else _best_content_node(soup)
+    markdown = html_to_markdown(str(content_node), heading_style="ATX", strip=["img"])
+    return _clean_multiline(markdown)
+
+
+def slice_text_window(text: str, max_chars: int, start_index: int = 0) -> dict[str, Any]:
+    content_length = len(text)
+    start = max(0, min(int(start_index or 0), content_length))
+    end = min(start + max(1, int(max_chars or 1)), content_length)
+    truncated = end < content_length
+    return {
+        "text": text[start:end].rstrip(),
+        "content_length": content_length,
+        "returned_range": {"start": start, "end": end},
+        "truncated": truncated,
+        "next_start_index": end if truncated else None,
+    }
+
+
+async def _limited_get(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    async with client.stream("GET", url, follow_redirects=True) as response:
+        response.raise_for_status()
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > MAX_DOWNLOAD_BYTES:
+                raise FetchSafetyError("页面过大，已停止下载")
+            chunks.append(chunk)
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            content=b"".join(chunks),
+            request=response.request,
+            extensions=response.extensions,
+        )
+
+
+async def _fetch_jina_reader_markdown(client: httpx.AsyncClient, url: str) -> dict[str, str]:
+    # Jina Reader 的公开用法是给原 URL 加前缀：https://r.jina.ai/https://example.com
+    reader_url = f"https://r.jina.ai/{url}"
+    response = await client.get(reader_url, follow_redirects=True)
+    response.raise_for_status()
+    return {"markdown": _clean_multiline(response.text), "reader_url": str(response.url)}
+
+
+async def search_web(
+    query: str,
+    max_results: int = 5,
+    region: str = "wt-wt",
+    language: str = "zh-cn",
+    config: GlobalWebConfig | None = None,
+) -> dict[str, Any]:
+    config = config or load_config()
+    query = _clean_text(query)
+    if not query:
+        return {"ok": False, "error": "query 不能为空", "results": []}
+
+    max_results = max(1, min(int(max_results or 5), config.max_search_results))
+    params = {"q": query, "kl": region or "wt-wt"}
+    url = "https://html.duckduckgo.com/html/"
+
+    try:
+        async with httpx.AsyncClient(
+            headers={**_headers(), "Accept-Language": language or "zh-cn"},
+            timeout=REQUEST_TIMEOUT,
+            max_redirects=5,
+        ) as client:
+            response = await client.get(url, params=params, follow_redirects=True)
+            response.raise_for_status()
+            results = normalize_search_results(response.text, max_results=max_results)
+            return {
+                "ok": True,
+                "query": query,
+                "backend": "duckduckgo_html",
+                "fetched_at": now_iso(),
+                "results": results,
+            }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "query": query,
+            "backend": "duckduckgo_html",
+            "fetched_at": now_iso(),
+            "error": f"{type(exc).__name__}: {exc}",
+            "results": [],
+        }
+
+
+async def fetch_page(
+    url: str,
+    max_chars: int | None = None,
+    start_index: int = 0,
+    extract_mode: str = "auto",
+    config: GlobalWebConfig | None = None,
+) -> dict[str, Any]:
+    config = config or load_config()
+    try:
+        safe_url = validate_fetch_url(url)
+    except FetchSafetyError as exc:
+        return {"ok": False, "url": url, "error": str(exc)}
+
+    max_chars = max(1, min(int(max_chars or config.default_fetch_chars), config.max_fetch_chars))
+    fallback_reason = ""
+    reader_url = ""
+
+    try:
+        async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT, max_redirects=5) as client:
+            try:
+                response = await _limited_get(client, safe_url)
+                content_type = response.headers.get("content-type", "")
+                markdown_full = extract_markdown(response.text, str(response.url), extract_mode=extract_mode)
+                backend = "direct"
+                final_url = str(response.url)
+                status_code: int | None = response.status_code
+
+                if config.enable_jina_fallback and len(markdown_full) < config.jina_min_chars:
+                    fallback_reason = f"direct content too short: {len(markdown_full)} chars"
+                    jina = await _fetch_jina_reader_markdown(client, safe_url)
+                    markdown_full = jina["markdown"]
+                    reader_url = jina["reader_url"]
+                    backend = "jina_reader"
+                    content_type = "text/markdown"
+            except Exception as exc:
+                if not config.enable_jina_fallback:
+                    raise
+                fallback_reason = f"{type(exc).__name__}: {exc}"
+                jina = await _fetch_jina_reader_markdown(client, safe_url)
+                markdown_full = jina["markdown"]
+                reader_url = jina["reader_url"]
+                backend = "jina_reader"
+                final_url = safe_url
+                status_code = None
+                content_type = "text/markdown"
+
+        window = slice_text_window(markdown_full, max_chars=max_chars, start_index=start_index)
+        result = {
+            "ok": True,
+            "url": safe_url,
+            "final_url": final_url,
+            "backend": backend,
+            "status_code": status_code,
+            "content_type": content_type,
+            "fetched_at": now_iso(),
+            "markdown": window["text"],
+            "content_length": window["content_length"],
+            "returned_range": window["returned_range"],
+            "truncated": window["truncated"],
+            "next_start_index": window["next_start_index"],
+        }
+        if reader_url:
+            result["reader_url"] = reader_url
+        if fallback_reason:
+            result["fallback_reason"] = fallback_reason
+        return result
+    except Exception as exc:
+        return {
+            "ok": False,
+            "url": safe_url,
+            "fetched_at": now_iso(),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+async def research_brief(
+    query: str,
+    max_sources: int = 3,
+    max_chars_per_source: int | None = None,
+    region: str = "wt-wt",
+    language: str = "zh-cn",
+    config: GlobalWebConfig | None = None,
+) -> dict[str, Any]:
+    config = config or load_config()
+    max_sources = max(1, min(int(max_sources or config.max_brief_sources), config.max_brief_sources))
+    max_chars_per_source = max(
+        1,
+        min(int(max_chars_per_source or config.brief_chars_per_source), config.max_fetch_chars),
+    )
+
+    search = await search_web(query, max_results=max_sources, region=region, language=language, config=config)
+    if not search.get("ok"):
+        return {
+            "ok": False,
+            "query": query,
+            "fetched_at": now_iso(),
+            "search": search,
+            "sources": [],
+        }
+
+    sources: list[dict[str, Any]] = []
+    for result in search.get("results", [])[:max_sources]:
+        fetched = await fetch_page(
+            result.get("url", ""),
+            max_chars=max_chars_per_source,
+            start_index=0,
+            extract_mode="auto",
+            config=config,
+        )
+        source: dict[str, Any] = {
+            "title": result.get("title", ""),
+            "url": result.get("url", ""),
+            "snippet": result.get("snippet", ""),
+            "ok": bool(fetched.get("ok")),
+        }
+        if fetched.get("ok"):
+            source.update(
+                {
+                    "final_url": fetched.get("final_url"),
+                    "backend": fetched.get("backend"),
+                    "markdown": fetched.get("markdown", ""),
+                    "content_length": fetched.get("content_length"),
+                    "truncated": fetched.get("truncated"),
+                    "next_start_index": fetched.get("next_start_index"),
+                }
+            )
+        else:
+            source["error"] = fetched.get("error", "fetch failed")
+        sources.append(source)
+
+    return {
+        "ok": True,
+        "query": query,
+        "backend": "duckduckgo_html",
+        "fetched_at": now_iso(),
+        "sources": sources,
+    }
+
+
+async def check_health() -> dict[str, Any]:
+    config = load_config()
+    checks: dict[str, Any] = {
+        "ok": True,
+        "fetched_at": now_iso(),
+        "config": config_to_dict(config),
+        "dependencies": {
+            "mcp": True,
+            "httpx": True,
+            "beautifulsoup4": True,
+            "markdownify": True,
+        },
+        "network": {},
+    }
+    async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT) as client:
+        for name, url in {
+            "duckduckgo": "https://duckduckgo.com/",
+            "github": "https://github.com/",
+            "anthropic": "https://www.anthropic.com/",
+            "jina_reader": "https://r.jina.ai/https://example.com/",
+        }.items():
+            try:
+                response = await client.get(url, follow_redirects=True)
+                checks["network"][name] = {"ok": response.status_code < 500, "status": response.status_code}
+            except Exception as exc:
+                checks["ok"] = False
+                checks["network"][name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return checks
+
+
+def to_json_text(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2)
