@@ -7,6 +7,10 @@
   "max_search_results": 10,
   "max_brief_sources": 3,
   "brief_chars_per_source": 2500,
+  "brief_concurrency": 3,
+  "dedupe_domains": true,
   "enable_jina_fallback": true,
-  "jina_min_chars": 300
+  "jina_min_chars": 300,
+  "allow_private_networks": false,
+  "cache_ttl_seconds": 1800
 }

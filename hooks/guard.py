@@ -85,14 +85,18 @@ def guard_pre_tool_use(payload: dict[str, Any], state_path: Path, config_path: P
     if model_matches_patterns(model, patterns) or is_allowed_environment(patterns):
         return 0
 
-    response = {
-        "decision": "block",
-        "reason": (
+    reason = (
             "cc-web MCP 仅允许配置中匹配的模型使用。"
             f"当前允许模型关键词: {', '.join(patterns)}。"
             "默认场景是给 DeepSeek 等缺少官方搜索能力的模型补全网页访问。"
             "官方 Claude 请优先使用原生 WebSearch/WebFetch。"
-        ),
+    )
+    response = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
     }
     print(json.dumps(response, ensure_ascii=False))
     return 0

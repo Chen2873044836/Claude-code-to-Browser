@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import httpx
 import pytest
@@ -48,6 +49,35 @@ def test_validate_fetch_url_only_allows_http_and_https():
         validate_fetch_url("ftp://example.com/file")
 
 
+def test_validate_fetch_url_blocks_private_networks_by_default():
+    blocked = [
+        "http://localhost/admin",
+        "http://127.0.0.1/admin",
+        "http://10.0.0.1/admin",
+        "http://172.16.0.1/admin",
+        "http://192.168.1.1/admin",
+        "http://169.254.169.254/latest/meta-data",
+        "http://[::1]/admin",
+        "http://[fc00::1]/admin",
+        "http://[fe80::1]/admin",
+    ]
+
+    for url in blocked:
+        with pytest.raises(FetchSafetyError):
+            validate_fetch_url(url)
+
+    assert validate_fetch_url("http://127.0.0.1/admin", allow_private_networks=True) == "http://127.0.0.1/admin"
+
+
+def test_extract_markdown_converts_relative_links_to_absolute():
+    html = '<html><body><main><a href="/docs/start">Start</a><a href="../api">API</a></main></body></html>'
+
+    markdown = extract_markdown(html, "https://example.com/guide/install")
+
+    assert "(https://example.com/docs/start)" in markdown
+    assert "(https://example.com/api)" in markdown
+
+
 def test_extract_markdown_removes_scripts_and_keeps_content():
     html = """
     <html>
@@ -62,6 +92,18 @@ def test_extract_markdown_removes_scripts_and_keeps_content():
     assert "Useful text" in markdown
     assert "alert" not in markdown
     assert "body{}" not in markdown
+
+
+def test_limited_get_blocks_redirect_to_private_network():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": "http://127.0.0.1/admin"}, request=request)
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await web._limited_get(client, "https://example.com/start", allow_private_networks=False)
+
+    with pytest.raises(FetchSafetyError):
+        asyncio.run(run())
 
 
 def test_is_deepseek_model_matches_known_names():
@@ -98,6 +140,90 @@ def test_fetch_page_returns_paginated_window_metadata(monkeypatch):
     assert result["next_start_index"] == 6
 
 
+def test_fetch_page_formats_json_content(monkeypatch):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+
+    async def fake_limited_get(client, url, allow_private_networks=False):
+        return httpx.Response(
+            200,
+            content=b'{"name":"cc-web","items":[1,2]}',
+            headers={"content-type": "application/json"},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+
+    result = asyncio.run(web.fetch_page("https://example.com/data.json", max_chars=2000, config=Config()))
+
+    assert result["ok"] is True
+    assert result["markdown"].startswith("{\n")
+    assert '"name": "cc-web"' in result["markdown"]
+
+
+def test_fetch_page_rejects_pdf_content(monkeypatch):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+
+    async def fake_limited_get(client, url, allow_private_networks=False):
+        return httpx.Response(
+            200,
+            content=b"%PDF-1.7",
+            headers={"content-type": "application/pdf"},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+
+    result = asyncio.run(web.fetch_page("https://example.com/file.pdf", config=Config()))
+
+    assert result["ok"] is False
+    assert "PDF" in result["error"]
+
+
+def test_fetch_page_uses_public_url_cache(monkeypatch, tmp_path):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 3600
+        cache_dir = str(tmp_path / "cache")
+
+    calls = 0
+
+    async def fake_limited_get(client, url, allow_private_networks=False):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            200,
+            content=b"<html><body><main><p>Cached public content that is long enough.</p></main></body></html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+
+    first = asyncio.run(web.fetch_page("https://example.com/cache", max_chars=1000, config=Config()))
+    second = asyncio.run(web.fetch_page("https://example.com/cache", max_chars=1000, config=Config()))
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert second["cache"] == "hit"
+    assert calls == 1
+
+
 def test_fetch_page_uses_jina_fallback_when_primary_fetch_fails(monkeypatch):
     class Config:
         default_fetch_chars = 1000
@@ -105,8 +231,9 @@ def test_fetch_page_uses_jina_fallback_when_primary_fetch_fails(monkeypatch):
         enable_jina_fallback = True
         jina_min_chars = 200
         cache_ttl_seconds = 0
+        allow_private_networks = False
 
-    async def failing_limited_get(client, url):
+    async def failing_limited_get(client, url, allow_private_networks=False):
         request = httpx.Request("GET", url)
         response = httpx.Response(403, request=request)
         raise httpx.HTTPStatusError("forbidden", request=request, response=response)
@@ -162,3 +289,47 @@ def test_research_brief_returns_compact_sources(monkeypatch):
     assert result["sources"][0]["title"] == "Doc A"
     assert result["sources"][0]["markdown"] == "x" * 20
     assert result["sources"][0]["truncated"] is True
+
+
+def test_research_brief_dedupes_same_domain_results(monkeypatch):
+    class Config:
+        max_brief_sources = 3
+        brief_chars_per_source = 20
+        max_fetch_chars = 60000
+        brief_concurrency = 2
+        dedupe_domains = True
+
+    fetched_urls = []
+
+    async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None):
+        return {
+            "ok": True,
+            "query": query,
+            "results": [
+                {"title": "Doc A", "url": "https://example.com/a", "snippet": "A snippet"},
+                {"title": "Doc B", "url": "https://example.com/b", "snippet": "B snippet"},
+                {"title": "Doc C", "url": "https://docs.example.org/c", "snippet": "C snippet"},
+            ],
+        }
+
+    async def fake_fetch_page(url, max_chars=None, start_index=0, extract_mode="auto", config=None):
+        fetched_urls.append(url)
+        return {
+            "ok": True,
+            "url": url,
+            "final_url": url,
+            "backend": "direct",
+            "markdown": url,
+            "content_length": len(url),
+            "truncated": False,
+            "next_start_index": None,
+        }
+
+    monkeypatch.setattr(web, "search_web", fake_search_web)
+    monkeypatch.setattr(web, "fetch_page", fake_fetch_page)
+
+    result = asyncio.run(web.research_brief("docs", max_sources=3, max_chars_per_source=20, config=Config()))
+
+    assert result["ok"] is True
+    assert fetched_urls == ["https://example.com/a", "https://docs.example.org/c"]
+    assert [source["url"] for source in result["sources"]] == fetched_urls

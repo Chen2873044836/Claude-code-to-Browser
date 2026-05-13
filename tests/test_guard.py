@@ -58,8 +58,10 @@ def test_pre_tool_use_blocks_non_deepseek_model(tmp_path):
 
     assert result.returncode == 0
     response = json.loads(result.stdout)
-    assert response["decision"] == "block"
-    assert "DeepSeek" in response["reason"]
+    output = response["hookSpecificOutput"]
+    assert output["hookEventName"] == "PreToolUse"
+    assert output["permissionDecision"] == "deny"
+    assert "DeepSeek" in output["permissionDecisionReason"]
 
 
 def test_pre_tool_use_allows_deepseek_model(tmp_path):
@@ -136,5 +138,6 @@ def test_pre_tool_use_block_message_mentions_configured_model_patterns(tmp_path)
 
     assert result.returncode == 0
     response = json.loads(result.stdout)
-    assert response["decision"] == "block"
-    assert "deepseek, qwen" in response["reason"]
+    output = response["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "deepseek, qwen" in output["permissionDecisionReason"]

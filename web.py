@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import ipaddress
 import json
 import re
+import inspect
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -21,6 +25,7 @@ USER_AGENT = (
 MAX_DOWNLOAD_BYTES = 5_000_000
 REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+DEFAULT_CACHE_DIR = Path.home() / ".cache" / "cc-web-mcp"
 
 
 class FetchSafetyError(ValueError):
@@ -44,6 +49,11 @@ class GlobalWebConfig:
     brief_chars_per_source: int = 2_500
     enable_jina_fallback: bool = True
     jina_min_chars: int = 300
+    allow_private_networks: bool = False
+    cache_ttl_seconds: int = 1_800
+    cache_dir: str = str(DEFAULT_CACHE_DIR)
+    brief_concurrency: int = 3
+    dedupe_domains: bool = True
 
 
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -52,6 +62,10 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(parsed, maximum))
+
+
+def _cfg(config: Any, name: str, default: Any) -> Any:
+    return getattr(config, name, default)
 
 
 def load_config(path: str | Path | None = None) -> GlobalWebConfig:
@@ -79,6 +93,11 @@ def load_config(path: str | Path | None = None) -> GlobalWebConfig:
         brief_chars_per_source=_bounded_int(raw.get("brief_chars_per_source"), 2_500, 100, 20_000),
         enable_jina_fallback=bool(raw.get("enable_jina_fallback", True)),
         jina_min_chars=_bounded_int(raw.get("jina_min_chars"), 300, 0, 5_000),
+        allow_private_networks=bool(raw.get("allow_private_networks", False)),
+        cache_ttl_seconds=_bounded_int(raw.get("cache_ttl_seconds"), 1_800, 0, 86_400),
+        cache_dir=str(raw.get("cache_dir") or DEFAULT_CACHE_DIR),
+        brief_concurrency=_bounded_int(raw.get("brief_concurrency"), 3, 1, 5),
+        dedupe_domains=bool(raw.get("dedupe_domains", True)),
     )
 
 
@@ -92,6 +111,11 @@ def config_to_dict(config: GlobalWebConfig) -> dict[str, Any]:
         "brief_chars_per_source": config.brief_chars_per_source,
         "enable_jina_fallback": config.enable_jina_fallback,
         "jina_min_chars": config.jina_min_chars,
+        "allow_private_networks": config.allow_private_networks,
+        "cache_ttl_seconds": config.cache_ttl_seconds,
+        "cache_dir": config.cache_dir,
+        "brief_concurrency": config.brief_concurrency,
+        "dedupe_domains": config.dedupe_domains,
     }
 
 
@@ -108,13 +132,35 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def validate_fetch_url(url: str) -> str:
+def _is_private_host(host: str) -> bool:
+    normalized = (host or "").strip().strip("[]").lower().rstrip(".")
+    if not normalized:
+        return False
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(normalized)
+        return bool(
+            ip.is_loopback
+            or ip.is_private
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+    except ValueError:
+        return False
+
+
+def validate_fetch_url(url: str, allow_private_networks: bool = False) -> str:
     cleaned = (url or "").strip()
     parsed = urlparse(cleaned)
     if parsed.scheme not in {"http", "https"}:
         raise FetchSafetyError("仅允许抓取 http/https URL")
     if not parsed.netloc:
         raise FetchSafetyError("URL 缺少主机名")
+    if not allow_private_networks and _is_private_host(parsed.hostname or ""):
+        raise FetchSafetyError("默认禁止抓取本机、内网、链路本地或云 metadata 地址")
     return cleaned
 
 
@@ -187,10 +233,20 @@ def _best_content_node(soup: BeautifulSoup):
     return soup.body or soup
 
 
+def _absolute_links(soup: BeautifulSoup, base_url: str) -> None:
+    if not base_url:
+        return
+    for node in soup.find_all("a"):
+        href = node.get("href")
+        if href:
+            node["href"] = urljoin(base_url, href)
+
+
 def extract_markdown(html: str, base_url: str = "", extract_mode: str = "auto") -> str:
     soup = BeautifulSoup(html, "html.parser")
     for node in soup(["script", "style", "noscript", "template", "svg"]):
         node.decompose()
+    _absolute_links(soup, base_url)
 
     mode = (extract_mode or "auto").lower()
     if mode == "text":
@@ -215,23 +271,40 @@ def slice_text_window(text: str, max_chars: int, start_index: int = 0) -> dict[s
     }
 
 
-async def _limited_get(client: httpx.AsyncClient, url: str) -> httpx.Response:
-    async with client.stream("GET", url, follow_redirects=True) as response:
-        response.raise_for_status()
-        chunks: list[bytes] = []
-        total = 0
-        async for chunk in response.aiter_bytes():
-            total += len(chunk)
-            if total > MAX_DOWNLOAD_BYTES:
-                raise FetchSafetyError("页面过大，已停止下载")
-            chunks.append(chunk)
-        return httpx.Response(
-            status_code=response.status_code,
-            headers=response.headers,
-            content=b"".join(chunks),
-            request=response.request,
-            extensions=response.extensions,
-        )
+async def _limited_get(
+    client: httpx.AsyncClient,
+    url: str,
+    allow_private_networks: bool = False,
+) -> httpx.Response:
+    current_url = validate_fetch_url(url, allow_private_networks=allow_private_networks)
+    for _ in range(6):
+        async with client.stream("GET", current_url, follow_redirects=False) as response:
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = response.headers.get("location")
+                if not location:
+                    response.raise_for_status()
+                current_url = validate_fetch_url(
+                    urljoin(str(response.url), location),
+                    allow_private_networks=allow_private_networks,
+                )
+                continue
+
+            response.raise_for_status()
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > MAX_DOWNLOAD_BYTES:
+                    raise FetchSafetyError("页面过大，已停止下载")
+                chunks.append(chunk)
+            return httpx.Response(
+                status_code=response.status_code,
+                headers=response.headers,
+                content=b"".join(chunks),
+                request=response.request,
+                extensions=response.extensions,
+            )
+    raise FetchSafetyError("重定向次数过多，已停止抓取")
 
 
 async def _fetch_jina_reader_markdown(client: httpx.AsyncClient, url: str) -> dict[str, str]:
@@ -240,6 +313,72 @@ async def _fetch_jina_reader_markdown(client: httpx.AsyncClient, url: str) -> di
     response = await client.get(reader_url, follow_redirects=True)
     response.raise_for_status()
     return {"markdown": _clean_multiline(response.text), "reader_url": str(response.url)}
+
+
+async def _call_limited_get(
+    client: httpx.AsyncClient,
+    url: str,
+    allow_private_networks: bool,
+) -> httpx.Response:
+    signature = inspect.signature(_limited_get)
+    if "allow_private_networks" in signature.parameters:
+        return await _limited_get(client, url, allow_private_networks=allow_private_networks)
+    return await _limited_get(client, url)
+
+
+def _format_response_content(response: httpx.Response, extract_mode: str) -> str:
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type in {"text/html", "application/xhtml+xml"} or not content_type:
+        return extract_markdown(response.text, str(response.url), extract_mode=extract_mode)
+    if content_type in {"text/plain", "text/markdown", "text/x-markdown"}:
+        return _clean_multiline(response.text)
+    if content_type in {"application/json", "application/ld+json"} or content_type.endswith("+json"):
+        try:
+            return json.dumps(response.json(), ensure_ascii=False, indent=2)
+        except json.JSONDecodeError:
+            return _clean_multiline(response.text)
+    if content_type == "application/pdf":
+        raise FetchSafetyError("暂不支持 PDF 正文提取，请后续接入 PDF 提取工具")
+    if not content_type.startswith("text/"):
+        raise FetchSafetyError(f"拒绝抓取二进制或暂不支持的内容类型: {content_type or 'unknown'}")
+    return _clean_multiline(response.text)
+
+
+def _cache_key(url: str, extract_mode: str, backend_hint: str = "direct") -> str:
+    raw = json.dumps({"url": url, "extract_mode": extract_mode, "backend": backend_hint}, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _cache_path(config: GlobalWebConfig, key: str) -> Path:
+    return Path(config.cache_dir) / f"{key}.json"
+
+
+def _read_cache(config: GlobalWebConfig, key: str) -> dict[str, Any] | None:
+    if _cfg(config, "cache_ttl_seconds", 0) <= 0 or _cfg(config, "allow_private_networks", False):
+        return None
+    path = _cache_path(config, key)
+    try:
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        fetched_at = float(data.get("cached_at", 0))
+        if datetime.now(timezone.utc).timestamp() - fetched_at > _cfg(config, "cache_ttl_seconds", 0):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _write_cache(config: GlobalWebConfig, key: str, data: dict[str, Any]) -> None:
+    if _cfg(config, "cache_ttl_seconds", 0) <= 0 or _cfg(config, "allow_private_networks", False):
+        return
+    try:
+        path = _cache_path(config, key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cache_data = {**data, "cached_at": datetime.now(timezone.utc).timestamp()}
+        path.write_text(json.dumps(cache_data, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        return
 
 
 async def search_web(
@@ -294,42 +433,75 @@ async def fetch_page(
 ) -> dict[str, Any]:
     config = config or load_config()
     try:
-        safe_url = validate_fetch_url(url)
+        safe_url = validate_fetch_url(url, allow_private_networks=_cfg(config, "allow_private_networks", False))
     except FetchSafetyError as exc:
         return {"ok": False, "url": url, "error": str(exc)}
 
-    max_chars = max(1, min(int(max_chars or config.default_fetch_chars), config.max_fetch_chars))
+    max_chars = max(1, min(int(max_chars or _cfg(config, "default_fetch_chars", 10_000)), _cfg(config, "max_fetch_chars", 60_000)))
     fallback_reason = ""
     reader_url = ""
+    cache_key = _cache_key(safe_url, extract_mode)
+    cached = _read_cache(config, cache_key)
 
     try:
-        async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT, max_redirects=5) as client:
-            try:
-                response = await _limited_get(client, safe_url)
-                content_type = response.headers.get("content-type", "")
-                markdown_full = extract_markdown(response.text, str(response.url), extract_mode=extract_mode)
-                backend = "direct"
-                final_url = str(response.url)
-                status_code: int | None = response.status_code
+        if cached:
+            markdown_full = str(cached.get("markdown_full", ""))
+            backend = str(cached.get("backend", "direct"))
+            final_url = str(cached.get("final_url", safe_url))
+            status_code = cached.get("status_code")
+            content_type = str(cached.get("content_type", ""))
+            reader_url = str(cached.get("reader_url", ""))
+            fallback_reason = str(cached.get("fallback_reason", ""))
+            cache_state = "hit"
+        else:
+            async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT, max_redirects=5) as client:
+                try:
+                    response = await _call_limited_get(
+                        client,
+                        safe_url,
+                        allow_private_networks=_cfg(config, "allow_private_networks", False),
+                    )
+                    final_url = validate_fetch_url(
+                        str(response.url),
+                        allow_private_networks=_cfg(config, "allow_private_networks", False),
+                    )
+                    content_type = response.headers.get("content-type", "")
+                    markdown_full = _format_response_content(response, extract_mode=extract_mode)
+                    backend = "direct"
+                    status_code: int | None = response.status_code
 
-                if config.enable_jina_fallback and len(markdown_full) < config.jina_min_chars:
-                    fallback_reason = f"direct content too short: {len(markdown_full)} chars"
+                    if _cfg(config, "enable_jina_fallback", True) and len(markdown_full) < _cfg(config, "jina_min_chars", 300):
+                        fallback_reason = f"direct content too short: {len(markdown_full)} chars"
+                        jina = await _fetch_jina_reader_markdown(client, safe_url)
+                        markdown_full = jina["markdown"]
+                        reader_url = jina["reader_url"]
+                        backend = "jina_reader"
+                        content_type = "text/markdown"
+                except Exception as exc:
+                    if not _cfg(config, "enable_jina_fallback", True):
+                        raise
+                    fallback_reason = f"{type(exc).__name__}: {exc}"
                     jina = await _fetch_jina_reader_markdown(client, safe_url)
                     markdown_full = jina["markdown"]
                     reader_url = jina["reader_url"]
                     backend = "jina_reader"
+                    final_url = safe_url
+                    status_code = None
                     content_type = "text/markdown"
-            except Exception as exc:
-                if not config.enable_jina_fallback:
-                    raise
-                fallback_reason = f"{type(exc).__name__}: {exc}"
-                jina = await _fetch_jina_reader_markdown(client, safe_url)
-                markdown_full = jina["markdown"]
-                reader_url = jina["reader_url"]
-                backend = "jina_reader"
-                final_url = safe_url
-                status_code = None
-                content_type = "text/markdown"
+            cache_state = "miss"
+            _write_cache(
+                config,
+                cache_key,
+                {
+                    "markdown_full": markdown_full,
+                    "backend": backend,
+                    "final_url": final_url,
+                    "status_code": status_code,
+                    "content_type": content_type,
+                    "reader_url": reader_url,
+                    "fallback_reason": fallback_reason,
+                },
+            )
 
         window = slice_text_window(markdown_full, max_chars=max_chars, start_index=start_index)
         result = {
@@ -345,6 +517,7 @@ async def fetch_page(
             "returned_range": window["returned_range"],
             "truncated": window["truncated"],
             "next_start_index": window["next_start_index"],
+            "cache": cache_state,
         }
         if reader_url:
             result["reader_url"] = reader_url
@@ -369,13 +542,19 @@ async def research_brief(
     config: GlobalWebConfig | None = None,
 ) -> dict[str, Any]:
     config = config or load_config()
-    max_sources = max(1, min(int(max_sources or config.max_brief_sources), config.max_brief_sources))
+    max_sources = max(1, min(int(max_sources or _cfg(config, "max_brief_sources", 3)), _cfg(config, "max_brief_sources", 3)))
     max_chars_per_source = max(
         1,
-        min(int(max_chars_per_source or config.brief_chars_per_source), config.max_fetch_chars),
+        min(int(max_chars_per_source or _cfg(config, "brief_chars_per_source", 2_500)), _cfg(config, "max_fetch_chars", 60_000)),
     )
 
-    search = await search_web(query, max_results=max_sources, region=region, language=language, config=config)
+    search = await search_web(
+        query,
+        max_results=max(_cfg(config, "max_search_results", 10), max_sources),
+        region=region,
+        language=language,
+        config=config,
+    )
     if not search.get("ok"):
         return {
             "ok": False,
@@ -385,35 +564,52 @@ async def research_brief(
             "sources": [],
         }
 
-    sources: list[dict[str, Any]] = []
-    for result in search.get("results", [])[:max_sources]:
-        fetched = await fetch_page(
-            result.get("url", ""),
-            max_chars=max_chars_per_source,
-            start_index=0,
-            extract_mode="auto",
-            config=config,
-        )
-        source: dict[str, Any] = {
-            "title": result.get("title", ""),
-            "url": result.get("url", ""),
-            "snippet": result.get("snippet", ""),
-            "ok": bool(fetched.get("ok")),
-        }
-        if fetched.get("ok"):
-            source.update(
-                {
-                    "final_url": fetched.get("final_url"),
-                    "backend": fetched.get("backend"),
-                    "markdown": fetched.get("markdown", ""),
-                    "content_length": fetched.get("content_length"),
-                    "truncated": fetched.get("truncated"),
-                    "next_start_index": fetched.get("next_start_index"),
-                }
+    selected_results: list[dict[str, str]] = []
+    seen_domains: set[str] = set()
+    for result in search.get("results", []):
+        parsed = urlparse(result.get("url", ""))
+        domain = (parsed.hostname or "").lower()
+        if _cfg(config, "dedupe_domains", True) and domain:
+            if domain in seen_domains:
+                continue
+            seen_domains.add(domain)
+        selected_results.append(result)
+        if len(selected_results) >= max_sources:
+            break
+
+    semaphore = asyncio.Semaphore(_cfg(config, "brief_concurrency", 3))
+
+    async def fetch_source(result: dict[str, str]) -> dict[str, Any]:
+        async with semaphore:
+            fetched = await fetch_page(
+                result.get("url", ""),
+                max_chars=max_chars_per_source,
+                start_index=0,
+                extract_mode="auto",
+                config=config,
             )
-        else:
-            source["error"] = fetched.get("error", "fetch failed")
-        sources.append(source)
+            source: dict[str, Any] = {
+                "title": result.get("title", ""),
+                "url": result.get("url", ""),
+                "snippet": result.get("snippet", ""),
+                "ok": bool(fetched.get("ok")),
+            }
+            if fetched.get("ok"):
+                source.update(
+                    {
+                        "final_url": fetched.get("final_url"),
+                        "backend": fetched.get("backend"),
+                        "markdown": fetched.get("markdown", ""),
+                        "content_length": fetched.get("content_length"),
+                        "truncated": fetched.get("truncated"),
+                        "next_start_index": fetched.get("next_start_index"),
+                    }
+                )
+            else:
+                source["error"] = fetched.get("error", "fetch failed")
+            return source
+
+    sources = await asyncio.gather(*(fetch_source(result) for result in selected_results))
 
     return {
         "ok": True,
