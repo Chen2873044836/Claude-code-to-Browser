@@ -22,6 +22,7 @@ MODEL_ENV_NAMES = (
 )
 CC_WEB_TOOL_PREFIXES = ("mcp__cc-web__", "mcp__cc_web__")
 CC_WEB_FETCH_TOOLS = ("mcp__cc-web__fetch_url", "mcp__cc_web__fetch_url")
+NATIVE_WEB_TOOLS = {"WebSearch", "WebFetch"}
 
 
 def load_allowed_patterns(path: Path) -> list[str]:
@@ -52,6 +53,10 @@ def allow_fetch_url_for_claude(path: Path) -> bool:
     return bool(load_config(path).get("allow_fetch_url_for_claude", False))
 
 
+def block_native_web_for_allowed_models(path: Path) -> bool:
+    return bool(load_config(path).get("block_native_web_for_allowed_models", True))
+
+
 def model_matches_patterns(model: str | None, patterns: list[str]) -> bool:
     normalized = (model or "").lower()
     return any(pattern in normalized for pattern in patterns)
@@ -68,6 +73,18 @@ def is_allowed_environment(patterns: list[str]) -> bool:
 
 def has_claude_environment_model() -> bool:
     return any(is_claude_model(os.environ.get(name)) for name in MODEL_ENV_NAMES)
+
+
+def deny(reason: str) -> int:
+    response = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+    }
+    print(json.dumps(response, ensure_ascii=False))
+    return 0
 
 
 def load_state(path: Path) -> dict[str, Any]:
@@ -101,13 +118,33 @@ def record_session_start(payload: dict[str, Any], state_path: Path) -> None:
 
 def guard_pre_tool_use(payload: dict[str, Any], state_path: Path, config_path: Path) -> int:
     tool_name = str(payload.get("tool_name") or "")
-    if not tool_name.startswith(CC_WEB_TOOL_PREFIXES):
+    is_cc_web_tool = tool_name.startswith(CC_WEB_TOOL_PREFIXES)
+    is_native_web_tool = tool_name in NATIVE_WEB_TOOLS
+    if not is_cc_web_tool and not is_native_web_tool:
         return 0
 
     patterns = load_allowed_patterns(config_path)
     session_id = str(payload.get("session_id") or "")
     state = load_state(state_path)
     model = str(state.get(session_id, {}).get("model") or "")
+
+    if is_native_web_tool and block_native_web_for_allowed_models(config_path):
+        if model:
+            is_allowed_model = model_matches_patterns(model, patterns)
+        else:
+            is_allowed_model = is_allowed_environment(patterns)
+        if is_allowed_model:
+            reason = (
+                f"{tool_name} 已为当前第三方模型禁用。"
+                "当前模型匹配 cc-web 的 allowed_model_patterns，"
+                "请改用 mcp__cc-web__research_brief 或 mcp__cc-web__web_search 搜索，"
+                "需要读取网页正文时使用 mcp__cc-web__fetch_url。"
+                "如确认该模型的原生 WebSearch/WebFetch 可用，可设置 "
+                "block_native_web_for_allowed_models: false。"
+            )
+            return deny(reason)
+        return 0
+
     allow_claude_fetch = allow_fetch_url_for_claude(config_path)
     if model:
         if model_matches_patterns(model, patterns):
@@ -127,15 +164,7 @@ def guard_pre_tool_use(payload: dict[str, Any], state_path: Path, config_path: P
         "官方 Claude 请优先使用原生 WebSearch/WebFetch；"
         "如确需允许 Claude 使用 cc-web fetch_url，请显式设置 allow_fetch_url_for_claude: true。"
     )
-    response = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        },
-    }
-    print(json.dumps(response, ensure_ascii=False))
-    return 0
+    return deny(reason)
 
 
 def main() -> int:

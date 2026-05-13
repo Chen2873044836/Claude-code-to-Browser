@@ -67,6 +67,7 @@ claude mcp get cc-web
   "allowed_model_patterns": ["deepseek"],
   "search_providers": ["duckduckgo", "bing_cn"],
   "allow_fetch_url_for_claude": false,
+  "block_native_web_for_allowed_models": true,
   "searxng_base_url": "",
   "prefer_technical_sources": true,
   "default_fetch_chars": 10000,
@@ -94,6 +95,12 @@ claude mcp get cc-web
 
 即使打开这个开关，`web_search` 和 `research_brief` 仍建议只给 `allowed_model_patterns` 中匹配的第三方模型使用。
 
+`block_native_web_for_allowed_models` 默认是 `true`。当当前模型匹配 `allowed_model_patterns` 时，守卫会阻止它调用 Claude Code 原生 `WebSearch/WebFetch`，并提示改用 `cc-web`。如果某个第三方 API 的原生 Web 工具已经可用，可以改成：
+
+```json
+"block_native_web_for_allowed_models": false
+```
+
 如果要同时适用于更多模型：
 
 ```json
@@ -117,6 +124,29 @@ claude mcp get cc-web
 `hooks\guard.py` 可作为 Claude Code `PreToolUse` hook 使用。它会读取 `config.json`，默认只允许匹配 `allowed_model_patterns` 的模型调用 `mcp__cc-web__*` / `mcp__cc_web__*` 工具。
 
 例外：当 `allow_fetch_url_for_claude` 为 `true` 时，官方 Claude 可以调用 `fetch_url`；`web_search` 和 `research_brief` 仍会被守卫拦截。
+
+如果要同时防止第三方模型误走 Claude Code 原生 `WebSearch/WebFetch`，`PreToolUse` 的 matcher 需要包含原生 Web 工具名，例如：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__cc-web__*|mcp__cc_web__*|WebSearch|WebFetch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py -3.11 .\\hooks\\guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+这样会形成双向守卫：官方 Claude 默认走原生 `WebSearch/WebFetch`；DeepSeek、Qwen、Kimi 等匹配模型默认走 `cc-web`。
 
 ## 自动授权
 
@@ -210,6 +240,7 @@ py -3.11 -m pip install -r requirements-optional.txt
 
 - Hook 守卫：`hooks/guard.py` 已输出 Claude Code `PreToolUse` 的 `hookSpecificOutput.permissionDecision = deny` 结构，降低后续 Claude Code 版本更新导致 hook 行为变化的风险。
 - Claude 误选防护：默认阻止官方 Claude 使用 cc-web，避免它在已有原生 `WebSearch/WebFetch` 时误选本 MCP；可通过 `allow_fetch_url_for_claude` 单独放开 `fetch_url`。
+- 第三方模型误选防护：可通过 `block_native_web_for_allowed_models` 阻止 DeepSeek、Qwen、Kimi 等匹配模型误走原生 `WebSearch/WebFetch`，让它们稳定使用 `cc-web`。
 - 内容类型分流：HTML、纯文本、Markdown、JSON 已分流处理；PDF 和未知二进制类型默认拒绝。
 - 相对链接转绝对链接：Markdown 转换前会把 `<a href>` 解析成绝对链接。
 - 搜索后端可插拔：已支持 `duckduckgo`、`bing_cn` 和 `searxng`，默认按 `duckduckgo -> bing_cn` 降级。
