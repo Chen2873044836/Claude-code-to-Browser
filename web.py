@@ -42,6 +42,9 @@ class SearchResult:
 @dataclass(frozen=True)
 class GlobalWebConfig:
     allowed_model_patterns: tuple[str, ...] = ("deepseek",)
+    search_provider: str = "duckduckgo"
+    searxng_base_url: str = ""
+    prefer_technical_sources: bool = True
     default_fetch_chars: int = 10_000
     max_fetch_chars: int = 60_000
     max_search_results: int = 10
@@ -54,6 +57,7 @@ class GlobalWebConfig:
     cache_dir: str = str(DEFAULT_CACHE_DIR)
     brief_concurrency: int = 3
     dedupe_domains: bool = True
+    enable_pdf_extract: bool = False
 
 
 def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
@@ -86,6 +90,9 @@ def load_config(path: str | Path | None = None) -> GlobalWebConfig:
 
     return GlobalWebConfig(
         allowed_model_patterns=allowed_model_patterns,
+        search_provider=str(raw.get("search_provider") or "duckduckgo").strip().lower(),
+        searxng_base_url=str(raw.get("searxng_base_url") or "").strip().rstrip("/"),
+        prefer_technical_sources=bool(raw.get("prefer_technical_sources", True)),
         default_fetch_chars=_bounded_int(raw.get("default_fetch_chars"), 10_000, 1_000, 60_000),
         max_fetch_chars=_bounded_int(raw.get("max_fetch_chars"), 60_000, 1_000, 120_000),
         max_search_results=_bounded_int(raw.get("max_search_results"), 10, 1, 20),
@@ -98,12 +105,16 @@ def load_config(path: str | Path | None = None) -> GlobalWebConfig:
         cache_dir=str(raw.get("cache_dir") or DEFAULT_CACHE_DIR),
         brief_concurrency=_bounded_int(raw.get("brief_concurrency"), 3, 1, 5),
         dedupe_domains=bool(raw.get("dedupe_domains", True)),
+        enable_pdf_extract=bool(raw.get("enable_pdf_extract", False)),
     )
 
 
 def config_to_dict(config: GlobalWebConfig) -> dict[str, Any]:
     return {
         "allowed_model_patterns": list(config.allowed_model_patterns),
+        "search_provider": config.search_provider,
+        "searxng_base_url": config.searxng_base_url,
+        "prefer_technical_sources": config.prefer_technical_sources,
         "default_fetch_chars": config.default_fetch_chars,
         "max_fetch_chars": config.max_fetch_chars,
         "max_search_results": config.max_search_results,
@@ -116,6 +127,7 @@ def config_to_dict(config: GlobalWebConfig) -> dict[str, Any]:
         "cache_dir": config.cache_dir,
         "brief_concurrency": config.brief_concurrency,
         "dedupe_domains": config.dedupe_domains,
+        "enable_pdf_extract": config.enable_pdf_extract,
     }
 
 
@@ -225,6 +237,47 @@ def normalize_search_results(html: str, max_results: int = 5) -> list[dict[str, 
     return [result.__dict__ for result in results]
 
 
+def normalize_searxng_results(payload: dict[str, Any], max_results: int = 5) -> list[dict[str, str]]:
+    results: list[SearchResult] = []
+    for item in payload.get("results", []):
+        title = _clean_text(str(item.get("title") or ""))
+        url = str(item.get("url") or "").strip()
+        snippet = _clean_text(str(item.get("content") or item.get("snippet") or ""))
+        if not title or not url:
+            continue
+        results.append(SearchResult(title=title, url=url, snippet=snippet))
+        if len(results) >= max_results:
+            break
+    return [result.__dict__ for result in results]
+
+
+def _technical_source_score(url: str) -> int:
+    host = (urlparse(url).hostname or "").lower()
+    path = urlparse(url).path.lower()
+    score = 0
+    if host == "github.com" or host.endswith(".github.com"):
+        score += 65
+    if host.startswith("docs.") or ".docs." in host or "readthedocs.io" in host:
+        score += 40
+    if host in {"pypi.org", "www.npmjs.com", "crates.io", "pkg.go.dev"}:
+        score += 35
+    if host in {"stackoverflow.com", "developer.mozilla.org"}:
+        score += 30
+    if any(part in host for part in ("docs", "developer", "dev", "api")):
+        score += 15
+    if any(part in path for part in ("/docs", "/documentation", "/guide", "/reference", "/api")):
+        score += 10
+    if any(bad in host for bad in ("blogspot.", "medium.com", "csdn.", "51cto.", "jianshu.")):
+        score -= 15
+    return score
+
+
+def rank_search_results(results: list[dict[str, str]]) -> list[dict[str, str]]:
+    indexed = list(enumerate(results))
+    ranked = sorted(indexed, key=lambda item: (-_technical_source_score(item[1].get("url", "")), item[0]))
+    return [item for _, item in ranked]
+
+
 def _best_content_node(soup: BeautifulSoup):
     for selector in ("main", "article", "[role=main]", ".content", "#content"):
         node = soup.select_one(selector)
@@ -326,7 +379,26 @@ async def _call_limited_get(
     return await _limited_get(client, url)
 
 
-def _format_response_content(response: httpx.Response, extract_mode: str) -> str:
+def _extract_pdf_text(content: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:
+        raise FetchSafetyError("PDF 提取需要安装可选依赖 pypdf") from exc
+
+    try:
+        import io
+
+        reader = PdfReader(io.BytesIO(content))
+        pages = [(page.extract_text() or "") for page in reader.pages]
+        text = _clean_multiline("\n".join(pages))
+    except Exception as exc:
+        raise FetchSafetyError(f"PDF 提取失败: {type(exc).__name__}: {exc}") from exc
+    if not text:
+        raise FetchSafetyError("PDF 未提取到可读文本")
+    return text
+
+
+def _format_response_content(response: httpx.Response, extract_mode: str, config: GlobalWebConfig | Any | None = None) -> str:
     content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if content_type in {"text/html", "application/xhtml+xml"} or not content_type:
         return extract_markdown(response.text, str(response.url), extract_mode=extract_mode)
@@ -338,6 +410,8 @@ def _format_response_content(response: httpx.Response, extract_mode: str) -> str
         except json.JSONDecodeError:
             return _clean_multiline(response.text)
     if content_type == "application/pdf":
+        if _cfg(config, "enable_pdf_extract", False):
+            return _extract_pdf_text(response.content)
         raise FetchSafetyError("暂不支持 PDF 正文提取，请后续接入 PDF 提取工具")
     if not content_type.startswith("text/"):
         raise FetchSafetyError(f"拒绝抓取二进制或暂不支持的内容类型: {content_type or 'unknown'}")
@@ -394,30 +468,50 @@ async def search_web(
         return {"ok": False, "error": "query 不能为空", "results": []}
 
     max_results = max(1, min(int(max_results or 5), config.max_search_results))
-    params = {"q": query, "kl": region or "wt-wt"}
-    url = "https://html.duckduckgo.com/html/"
+    provider = _cfg(config, "search_provider", "duckduckgo")
 
     try:
-        async with httpx.AsyncClient(
-            headers={**_headers(), "Accept-Language": language or "zh-cn"},
-            timeout=REQUEST_TIMEOUT,
-            max_redirects=5,
-        ) as client:
-            response = await client.get(url, params=params, follow_redirects=True)
-            response.raise_for_status()
-            results = normalize_search_results(response.text, max_results=max_results)
-            return {
-                "ok": True,
-                "query": query,
-                "backend": "duckduckgo_html",
-                "fetched_at": now_iso(),
-                "results": results,
-            }
+        if provider == "searxng":
+            base_url = _cfg(config, "searxng_base_url", "").rstrip("/")
+            if not base_url:
+                raise ValueError("searxng_base_url 不能为空")
+            async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT, max_redirects=5) as client:
+                response = await client.get(
+                    f"{base_url}/search",
+                    params={"q": query, "format": "json", "language": language or "zh-cn"},
+                    follow_redirects=True,
+                )
+                response.raise_for_status()
+                results = normalize_searxng_results(response.json(), max_results=max_results)
+            backend = "searxng"
+        else:
+            params = {"q": query, "kl": region or "wt-wt"}
+            url = "https://html.duckduckgo.com/html/"
+            async with httpx.AsyncClient(
+                headers={**_headers(), "Accept-Language": language or "zh-cn"},
+                timeout=REQUEST_TIMEOUT,
+                max_redirects=5,
+            ) as client:
+                response = await client.get(url, params=params, follow_redirects=True)
+                response.raise_for_status()
+                results = normalize_search_results(response.text, max_results=max_results)
+            backend = "duckduckgo_html"
+
+        if _cfg(config, "prefer_technical_sources", True):
+            results = rank_search_results(results)
+
+        return {
+            "ok": True,
+            "query": query,
+            "backend": backend,
+            "fetched_at": now_iso(),
+            "results": results[:max_results],
+        }
     except Exception as exc:
         return {
             "ok": False,
             "query": query,
-            "backend": "duckduckgo_html",
+            "backend": provider,
             "fetched_at": now_iso(),
             "error": f"{type(exc).__name__}: {exc}",
             "results": [],
@@ -466,7 +560,7 @@ async def fetch_page(
                         allow_private_networks=_cfg(config, "allow_private_networks", False),
                     )
                     content_type = response.headers.get("content-type", "")
-                    markdown_full = _format_response_content(response, extract_mode=extract_mode)
+                    markdown_full = _format_response_content(response, extract_mode=extract_mode, config=config)
                     backend = "direct"
                     status_code: int | None = response.status_code
 

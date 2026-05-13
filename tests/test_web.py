@@ -5,13 +5,7 @@ import httpx
 import pytest
 
 import web
-from web import (
-    FetchSafetyError,
-    extract_markdown,
-    is_deepseek_model,
-    normalize_search_results,
-    validate_fetch_url,
-)
+from web import FetchSafetyError, extract_markdown, is_deepseek_model, normalize_search_results, validate_fetch_url
 
 
 def test_normalize_search_results_from_duckduckgo_html():
@@ -37,6 +31,90 @@ def test_normalize_search_results_from_duckduckgo_html():
             "snippet": "",
         },
     ]
+
+
+def test_rank_search_results_prioritizes_authoritative_technical_sources():
+    results = [
+        {"title": "Copied guide", "url": "https://random-seo.example/post", "snippet": "mirror"},
+        {"title": "Project docs", "url": "https://docs.example.org/install", "snippet": "official"},
+        {"title": "GitHub repo", "url": "https://github.com/modelcontextprotocol/servers", "snippet": "source"},
+        {"title": "Package", "url": "https://pypi.org/project/httpx/", "snippet": "package"},
+    ]
+
+    ranked = web.rank_search_results(results)
+
+    assert [item["url"] for item in ranked][:3] == [
+        "https://github.com/modelcontextprotocol/servers",
+        "https://docs.example.org/install",
+        "https://pypi.org/project/httpx/",
+    ]
+
+
+def test_normalize_searxng_results():
+    payload = {
+        "results": [
+            {
+                "title": "Official Docs",
+                "url": "https://docs.example.com",
+                "content": "Documentation snippet",
+            },
+            {
+                "title": "",
+                "url": "https://invalid.example",
+                "content": "missing title",
+            },
+        ]
+    }
+
+    results = web.normalize_searxng_results(payload, max_results=5)
+
+    assert results == [
+        {
+            "title": "Official Docs",
+            "url": "https://docs.example.com",
+            "snippet": "Documentation snippet",
+        }
+    ]
+
+
+def test_search_web_uses_searxng_provider(monkeypatch):
+    class Config:
+        search_provider = "searxng"
+        searxng_base_url = "https://search.example"
+        max_search_results = 10
+        prefer_technical_sources = True
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            assert url == "https://search.example/search"
+            assert params["format"] == "json"
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {"title": "SEO", "url": "https://random.example/post", "content": "copy"},
+                        {"title": "GitHub", "url": "https://github.com/example/repo", "content": "repo"},
+                    ]
+                },
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=2, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "searxng"
+    assert result["results"][0]["url"] == "https://github.com/example/repo"
 
 
 def test_validate_fetch_url_only_allows_http_and_https():
@@ -189,6 +267,36 @@ def test_fetch_page_rejects_pdf_content(monkeypatch):
 
     assert result["ok"] is False
     assert "PDF" in result["error"]
+
+
+def test_fetch_page_extracts_pdf_when_enabled(monkeypatch):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+        enable_pdf_extract = True
+
+    async def fake_limited_get(client, url, allow_private_networks=False):
+        return httpx.Response(
+            200,
+            content=b"%PDF-1.7 fake",
+            headers={"content-type": "application/pdf"},
+            request=httpx.Request("GET", url),
+        )
+
+    def fake_extract_pdf(content):
+        return "PDF extracted text"
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+    monkeypatch.setattr(web, "_extract_pdf_text", fake_extract_pdf)
+
+    result = asyncio.run(web.fetch_page("https://example.com/file.pdf", config=Config()))
+
+    assert result["ok"] is True
+    assert result["markdown"] == "PDF extracted text"
 
 
 def test_fetch_page_uses_public_url_cache(monkeypatch, tmp_path):

@@ -2,6 +2,9 @@
   "allowed_model_patterns": [
     "deepseek"
   ],
+  "search_provider": "duckduckgo",
+  "searxng_base_url": "",
+  "prefer_technical_sources": true,
   "default_fetch_chars": 10000,
   "max_fetch_chars": 60000,
   "max_search_results": 10,
@@ -12,5 +15,6 @@
   "enable_jina_fallback": true,
   "jina_min_chars": 300,
   "allow_private_networks": false,
-  "cache_ttl_seconds": 1800
+  "cache_ttl_seconds": 1800,
+  "enable_pdf_extract": false
 }
