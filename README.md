@@ -54,9 +54,17 @@ claude mcp add --scope user --transport stdio cc-web -- <Python解释器路径> 
 claude mcp get cc-web
 ```
 
-5. 在 Claude Code 中调用 `health_check`，确认依赖和网络连通性。
+5. 安装 Claude Code hook 守卫：
 
-如需限制只有 DeepSeek 等第三方模型能调用本 MCP，请把 `hooks\guard.py` 配置为 Claude Code 的 `PreToolUse` hook，并在 `config.json` 的 `allowed_model_patterns` 中维护允许模型。
+```powershell
+py -3.11 .\scripts\install_hook.py
+```
+
+这个脚本会合并更新用户级 `~\.claude\settings.json`，并在写入前创建 `settings.json.cc-web-backup.<时间戳>` 备份。它可以重复运行，不会重复添加同一条 hook。
+
+6. 在 Claude Code 中调用 `health_check`，确认依赖和网络连通性。
+
+如需限制只有 DeepSeek 等第三方模型能调用本 MCP，请保留 hook 守卫，并在 `config.json` 的 `allowed_model_patterns` 中维护允许模型。
 
 ## 配置
 
@@ -130,9 +138,21 @@ claude mcp get cc-web
 ```json
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "py -3.11 .\\hooks\\guard.py",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
-        "matcher": "mcp__cc-web__*|mcp__cc_web__*|WebSearch|WebFetch",
+        "matcher": "^(mcp__cc[-_]web__.*|WebSearch|WebFetch)$",
         "hooks": [
           {
             "type": "command",
@@ -145,6 +165,8 @@ claude mcp get cc-web
   }
 }
 ```
+
+推荐直接运行 `py -3.11 .\scripts\install_hook.py` 自动写入。上面的 JSON 主要用于手动检查或迁移到项目级 settings。
 
 这样会形成双向守卫：官方 Claude 默认走原生 `WebSearch/WebFetch`；DeepSeek、Qwen、Kimi 等匹配模型默认走 `cc-web`。
 
@@ -185,10 +207,12 @@ claude mcp get cc-web
 ```json
 {
   "permissions": {
-    "allow": ["mcp__cc-web__*"]
+    "allow": ["mcp__cc-web__*", "mcp__cc_web__*"]
   }
 }
 ```
+
+注意：这里是权限规则里的通配写法；上面的 hook `matcher` 使用 Claude Code hook matcher 规则，推荐保留正则 `^(mcp__cc[-_]web__.*|WebSearch|WebFetch)$`。
 
 不建议为了这个 MCP 长期开启 `--dangerously-skip-permissions`。更稳妥的方式是只 allow `cc-web` 的只读工具，同时保留 `hooks\guard.py` 对非目标模型的拦截。
 
