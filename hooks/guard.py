@@ -22,7 +22,7 @@ MODEL_ENV_NAMES = (
 )
 CC_WEB_TOOL_PREFIXES = ("mcp__cc-web__", "mcp__cc_web__")
 CC_WEB_FETCH_TOOLS = ("mcp__cc-web__fetch_url", "mcp__cc_web__fetch_url")
-NATIVE_WEB_TOOLS = {"WebSearch", "WebFetch"}
+NATIVE_WEB_TOOLS = {"WebFetch"}
 
 
 def load_allowed_patterns(path: Path) -> list[str]:
@@ -146,7 +146,7 @@ def guard_pre_tool_use(payload: dict[str, Any], state_path: Path, config_path: P
             additional_context = (
                 f"Tool routing instruction: Do not retry {tool_name}. "
                 "The current model matches cc-web allowed_model_patterns, so native "
-                "Claude Code WebSearch/WebFetch is unavailable or unsuitable. "
+                "Claude Code WebFetch is unavailable or unsuitable. "
                 "For web research, call mcp__cc-web__research_brief first. "
                 "If you need raw search results, call mcp__cc-web__web_search. "
                 "If you need to read a specific URL, call mcp__cc-web__fetch_url. "

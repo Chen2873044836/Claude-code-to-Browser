@@ -9,7 +9,10 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MATCHER = r"^(mcp__cc[-_]web__.*|WebSearch|WebFetch)$"
+DEFAULT_MATCHER = r"^(mcp__cc[-_]web__.*|WebFetch)$"
+LEGACY_MATCHERS = (
+    r"^(mcp__cc[-_]web__.*|WebSearch|WebFetch)$",
+)
 
 
 def default_settings_path() -> Path:
@@ -84,7 +87,7 @@ def is_cc_web_guard_command(command: Any) -> bool:
 def is_cc_web_guard_entry(entry: Any, matcher: str) -> bool:
     if not isinstance(entry, dict):
         return False
-    if entry.get("matcher", "") != matcher:
+    if entry.get("matcher", "") not in {matcher, *LEGACY_MATCHERS}:
         return False
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):

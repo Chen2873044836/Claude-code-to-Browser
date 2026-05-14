@@ -54,7 +54,15 @@ claude mcp add --scope user --transport stdio cc-web -- <Python解释器路径> 
 claude mcp get cc-web
 ```
 
-5. 安装 Claude Code hook 守卫：
+5. 安装 Claude Code 启动指令：
+
+```powershell
+py -3.11 .\scripts\install_instructions.py
+```
+
+这个脚本会把 cc-web 路由说明写入用户级 `~\.claude\CLAUDE.md`。它的作用是让 DeepSeek、Qwen、Kimi 等第三方模型在第一次思考时就避开原生 `WebSearch`，直接使用 cc-web。
+
+6. 安装 Claude Code hook 守卫：
 
 ```powershell
 py -3.11 .\scripts\install_hook.py
@@ -62,9 +70,9 @@ py -3.11 .\scripts\install_hook.py
 
 这个脚本会合并更新用户级 `~\.claude\settings.json`，并在写入前创建 `settings.json.cc-web-backup.<时间戳>` 备份。它可以重复运行，不会重复添加同一条 hook。
 
-6. 在 Claude Code 中调用 `health_check`，确认依赖和网络连通性。
+7. 在 Claude Code 中调用 `health_check`，确认依赖和网络连通性。
 
-如需限制只有 DeepSeek 等第三方模型能调用本 MCP，请保留 hook 守卫，并在 `config.json` 的 `allowed_model_patterns` 中维护允许模型。
+如需限制只有 DeepSeek 等第三方模型能调用本 MCP，请保留启动指令和 hook 守卫，并在 `config.json` 的 `allowed_model_patterns` 中维护允许模型。
 
 ## 配置
 
@@ -103,7 +111,7 @@ py -3.11 .\scripts\install_hook.py
 
 即使打开这个开关，`web_search` 和 `research_brief` 仍建议只给 `allowed_model_patterns` 中匹配的第三方模型使用。
 
-`block_native_web_for_allowed_models` 默认是 `true`。当当前模型匹配 `allowed_model_patterns` 时，守卫会阻止它调用 Claude Code 原生 `WebSearch/WebFetch`，并提示改用 `cc-web`。如果某个第三方 API 的原生 Web 工具已经可用，可以改成：
+`block_native_web_for_allowed_models` 默认是 `true`。当当前模型匹配 `allowed_model_patterns` 时，守卫会阻止它调用 Claude Code 原生 `WebFetch`，并提示改用 `cc-web`。注意：部分第三方 Anthropic-compatible API 会在服务端直接拒绝 `WebSearch`，请求到不了 Claude Code 本地工具执行层，因此 `WebSearch` 必须靠 `CLAUDE.md` 启动指令提前绕开。如果某个第三方 API 的原生 Web 工具已经可用，可以改成：
 
 ```json
 "block_native_web_for_allowed_models": false
@@ -129,11 +137,13 @@ py -3.11 .\scripts\install_hook.py
 
 ## Hook 守卫
 
-`hooks\guard.py` 可作为 Claude Code `PreToolUse` hook 使用。它会读取 `config.json`，默认只允许匹配 `allowed_model_patterns` 的模型调用 `mcp__cc-web__*` / `mcp__cc_web__*` 工具。
+`hooks\guard.py` 可作为 Claude Code `PreToolUse` hook 使用。它会读取 `config.json`，默认只允许匹配 `allowed_model_patterns` 的模型调用 `mcp__cc-web__*` / `mcp__cc_web__*` 工具，并拦截第三方模型误用本地可达的原生 `WebFetch`。
 
 例外：当 `allow_fetch_url_for_claude` 为 `true` 时，官方 Claude 可以调用 `fetch_url`；`web_search` 和 `research_brief` 仍会被守卫拦截。
 
-如果要同时防止第三方模型误走 Claude Code 原生 `WebSearch/WebFetch`，`PreToolUse` 的 matcher 需要包含原生 Web 工具名，例如：
+`WebSearch` 的边界要特别注意：在 DeepSeek 等第三方 API 中，`WebSearch` 可能在 API 请求阶段直接返回 400，`PreToolUse` hook 不会触发。所以 `WebSearch` 预防依赖 `scripts\install_instructions.py` 写入的 `CLAUDE.md` 指令；hook 只负责 `WebFetch` 和 cc-web 工具的本地兜底。
+
+`PreToolUse` 的 matcher 推荐包含 cc-web MCP 工具和 `WebFetch`，例如：
 
 ```json
 {
@@ -152,7 +162,7 @@ py -3.11 .\scripts\install_hook.py
     ],
     "PreToolUse": [
       {
-        "matcher": "^(mcp__cc[-_]web__.*|WebSearch|WebFetch)$",
+        "matcher": "^(mcp__cc[-_]web__.*|WebFetch)$",
         "hooks": [
           {
             "type": "command",
@@ -168,17 +178,18 @@ py -3.11 .\scripts\install_hook.py
 
 推荐直接运行 `py -3.11 .\scripts\install_hook.py` 自动写入。上面的 JSON 主要用于手动检查或迁移到项目级 settings。
 
-这样会形成双向守卫：官方 Claude 默认走原生 `WebSearch/WebFetch`；DeepSeek、Qwen、Kimi 等匹配模型默认走 `cc-web`。
+这样会形成双层路由：`CLAUDE.md` 负责在模型发起请求前预防 `WebSearch`；hook 负责在本地执行层拦截 `WebFetch` 和 cc-web 误用。官方 Claude 默认走原生 `WebSearch/WebFetch`；DeepSeek、Qwen、Kimi 等匹配模型默认走 `cc-web`。
 
 守卫输出会同时包含：
 
 - `permissionDecisionReason`：用于权限结果和界面提示。
-- `additionalContext`：注入到模型上下文，明确提示“不要重试 WebSearch/WebFetch，改用 cc-web MCP”。
+- `additionalContext`：注入到模型上下文，明确提示“不要重试 WebFetch，改用 cc-web MCP”。
 
-如果希望进一步减少第三方模型第一次误选原生工具，可以在项目的 `CLAUDE.md` 或 `AGENTS.md` 中加入类似说明：
+`scripts\install_instructions.py` 默认写入用户级 `~\.claude\CLAUDE.md`。如果希望只在某个项目中启用，也可以在项目的 `CLAUDE.md` 或 `AGENTS.md` 中加入类似说明：
 
 ```markdown
 当当前模型是 DeepSeek、Qwen、Kimi 等第三方模型时，外网搜索和网页抓取优先使用 cc-web MCP：
+- 不要调用 WebSearch；部分第三方 API 会在 Claude Code hook 触发前直接拒绝 WebSearch。
 - 搜索/概览：mcp__cc-web__research_brief
 - 原始搜索：mcp__cc-web__web_search
 - 读取 URL：mcp__cc-web__fetch_url
@@ -227,7 +238,7 @@ py -3.11 .\scripts\install_hook.py
 }
 ```
 
-注意：这里是权限规则里的通配写法；上面的 hook `matcher` 使用 Claude Code hook matcher 规则，推荐保留正则 `^(mcp__cc[-_]web__.*|WebSearch|WebFetch)$`。
+注意：这里是权限规则里的通配写法；上面的 hook `matcher` 使用 Claude Code hook matcher 规则，推荐保留正则 `^(mcp__cc[-_]web__.*|WebFetch)$`。
 
 不建议为了这个 MCP 长期开启 `--dangerously-skip-permissions`。更稳妥的方式是只 allow `cc-web` 的只读工具，同时保留 `hooks\guard.py` 对非目标模型的拦截。
 
@@ -279,7 +290,7 @@ py -3.11 -m pip install -r requirements-optional.txt
 
 - Hook 守卫：`hooks/guard.py` 已输出 Claude Code `PreToolUse` 的 `hookSpecificOutput.permissionDecision = deny` 结构，降低后续 Claude Code 版本更新导致 hook 行为变化的风险。
 - Claude 误选防护：默认阻止官方 Claude 使用 cc-web，避免它在已有原生 `WebSearch/WebFetch` 时误选本 MCP；可通过 `allow_fetch_url_for_claude` 单独放开 `fetch_url`。
-- 第三方模型误选防护：可通过 `block_native_web_for_allowed_models` 阻止 DeepSeek、Qwen、Kimi 等匹配模型误走原生 `WebSearch/WebFetch`，让它们稳定使用 `cc-web`。
+- 第三方模型误选防护：通过 `CLAUDE.md` 指令预防 DeepSeek、Qwen、Kimi 等匹配模型误走原生 `WebSearch`；通过 `block_native_web_for_allowed_models` 和 hook 兜底拦截本地可达的 `WebFetch`。
 - 内容类型分流：HTML、纯文本、Markdown、JSON 已分流处理；PDF 和未知二进制类型默认拒绝。
 - 相对链接转绝对链接：Markdown 转换前会把 `<a href>` 解析成绝对链接。
 - 搜索后端可插拔：已支持 `duckduckgo`、`bing_cn` 和 `searxng`，默认按 `duckduckgo -> bing_cn` 降级。

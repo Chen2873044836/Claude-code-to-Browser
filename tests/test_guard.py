@@ -174,7 +174,7 @@ def test_pre_tool_use_allows_deepseek_model(tmp_path):
     assert result.stdout.strip() == ""
 
 
-def test_pre_tool_use_blocks_native_web_search_for_allowed_model_by_default(tmp_path):
+def test_pre_tool_use_does_not_claim_to_block_native_web_search(tmp_path):
     state = tmp_path / "state.json"
     config = tmp_path / "config.json"
     state.write_text(json.dumps({"s1": {"model": "deepseek-v4-flash"}}), encoding="utf-8")
@@ -191,14 +191,7 @@ def test_pre_tool_use_blocks_native_web_search_for_allowed_model_by_default(tmp_
     )
 
     assert result.returncode == 0
-    response = json.loads(result.stdout)
-    output = response["hookSpecificOutput"]
-    assert output["permissionDecision"] == "deny"
-    assert "cc-web" in output["permissionDecisionReason"]
-    assert "research_brief" in output["permissionDecisionReason"]
-    assert "additionalContext" in output
-    assert "mcp__cc-web__research_brief" in output["additionalContext"]
-    assert "Do not retry WebSearch" in output["additionalContext"]
+    assert result.stdout.strip() == ""
 
 
 def test_pre_tool_use_blocks_native_web_fetch_for_allowed_model_by_default(tmp_path):
@@ -254,7 +247,7 @@ def test_pre_tool_use_allows_native_web_for_allowed_model_when_disabled(tmp_path
     assert result.stdout.strip() == ""
 
 
-def test_pre_tool_use_allows_native_web_for_claude_model(tmp_path):
+def test_pre_tool_use_allows_native_web_search_for_claude_model(tmp_path):
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"s1": {"model": "claude-opus-4-6"}}), encoding="utf-8")
 
@@ -271,7 +264,7 @@ def test_pre_tool_use_allows_native_web_for_claude_model(tmp_path):
     assert result.stdout.strip() == ""
 
 
-def test_pre_tool_use_blocks_native_web_for_allowed_environment_when_model_is_missing(tmp_path):
+def test_pre_tool_use_does_not_block_native_web_search_for_allowed_environment(tmp_path):
     state = tmp_path / "state.json"
     state.write_text(json.dumps({}), encoding="utf-8")
     env = {**os.environ, "ANTHROPIC_MODEL": "deepseek-v4-pro[1m]"}
@@ -287,8 +280,7 @@ def test_pre_tool_use_blocks_native_web_for_allowed_environment_when_model_is_mi
     )
 
     assert result.returncode == 0
-    response = json.loads(result.stdout)
-    assert response["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert result.stdout.strip() == ""
 
 
 def test_pre_tool_use_uses_recorded_model_before_environment_for_native_web(tmp_path):

@@ -44,7 +44,7 @@ def test_install_hook_creates_hooks_and_preserves_existing_settings(tmp_path):
     assert data["enabledPlugins"]["superpowers@claude-plugins-official"] is True
     assert data["hooks"]["SessionStart"][0]["matcher"] == ""
     pre_tool = data["hooks"]["PreToolUse"][0]
-    assert pre_tool["matcher"] == r"^(mcp__cc[-_]web__.*|WebSearch|WebFetch)$"
+    assert pre_tool["matcher"] == r"^(mcp__cc[-_]web__.*|WebFetch)$"
     assert pre_tool["hooks"][0]["type"] == "command"
     assert "hooks/guard.py" in pre_tool["hooks"][0]["command"].replace("\\", "/")
 
@@ -87,7 +87,7 @@ def test_install_hook_preserves_unrelated_hooks(tmp_path):
     data = json.loads(settings.read_text(encoding="utf-8"))
     matchers = [item["matcher"] for item in data["hooks"]["PreToolUse"]]
     assert "Bash" in matchers
-    assert r"^(mcp__cc[-_]web__.*|WebSearch|WebFetch)$" in matchers
+    assert r"^(mcp__cc[-_]web__.*|WebFetch)$" in matchers
 
 
 def test_install_hook_replaces_existing_cc_web_hook_when_command_changes(tmp_path):
@@ -133,4 +133,5 @@ def test_install_hook_replaces_existing_cc_web_hook_when_command_changes(tmp_pat
     data = json.loads(settings.read_text(encoding="utf-8"))
     assert len(data["hooks"]["SessionStart"]) == 1
     assert len(data["hooks"]["PreToolUse"]) == 1
+    assert data["hooks"]["PreToolUse"][0]["matcher"] == r"^(mcp__cc[-_]web__.*|WebFetch)$"
     assert data["hooks"]["PreToolUse"][0]["hooks"][0]["command"].startswith("E:\\anaconda\\python.exe ")
