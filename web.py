@@ -29,6 +29,51 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "cc-web-mcp"
 CACHE_SCHEMA_VERSION = 2
 BING_CN_SCOPE_NOTE = "bing_cn may be region-biased and is used as fallback; it is not equivalent to full global search."
+ANTI_BOT_DOMAINS = (
+    "zhihu.com",
+    "weixin.qq.com",
+    "x.com",
+    "twitter.com",
+    "reddit.com",
+)
+CHALLENGE_PATH_HINTS = (
+    "/account/unhuman",
+    "/captcha",
+    "/challenge",
+    "/security",
+    "/verify",
+)
+LOGIN_PATH_HINTS = (
+    "/login",
+    "/signin",
+    "/sign_in",
+    "/auth",
+)
+CHALLENGE_KEYWORDS = (
+    "安全验证",
+    "访问异常",
+    "验证码",
+    "请完成验证",
+    "人机验证",
+    "verify you are human",
+    "are you a human",
+    "unusual traffic",
+    "just a moment",
+    "attention required",
+    "checking your browser",
+)
+LOGIN_KEYWORDS = (
+    "登录后查看",
+    "请登录",
+    "login required",
+    "sign in to continue",
+)
+JS_REQUIRED_KEYWORDS = (
+    "enable javascript",
+    "requires javascript",
+    "请启用 javascript",
+    "请启用js",
+)
 BLOCKED_IP_NETWORKS = tuple(
     ipaddress.ip_network(network)
     for network in (
@@ -51,6 +96,12 @@ BLOCKED_IP_NETWORKS = tuple(
 
 class FetchSafetyError(ValueError):
     pass
+
+
+class FetchDiagnosticError(FetchSafetyError):
+    def __init__(self, message: str, diagnostics: dict[str, Any]):
+        super().__init__(message)
+        self.diagnostics = diagnostics
 
 
 @dataclass(frozen=True)
@@ -501,6 +552,121 @@ def _absolute_links(soup: BeautifulSoup, base_url: str) -> None:
             node["href"] = urljoin(base_url, href)
 
 
+def _domain_matches(host: str, domains: tuple[str, ...]) -> bool:
+    normalized = (host or "").lower().strip(".")
+    return any(normalized == domain or normalized.endswith(f".{domain}") for domain in domains)
+
+
+def _add_signal(signals: list[str], signal: str) -> None:
+    if signal and signal not in signals:
+        signals.append(signal)
+
+
+def _extract_html_title(html: str) -> str:
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+    if soup.title:
+        return _clean_text(soup.title.get_text(" "))
+    return ""
+
+
+def _safe_response_text(response: httpx.Response, limit: int = 5000) -> str:
+    try:
+        if not response.content:
+            return ""
+        return response.text[:limit]
+    except httpx.ResponseNotRead:
+        return ""
+
+
+def _diagnostics_response(
+    issue_type: str,
+    confidence: str,
+    signals: list[str],
+) -> dict[str, Any]:
+    recommendation = "抓取失败原因不明确；建议稍后重试，或换用搜索结果摘要和其他来源。"
+    if issue_type in {"captcha_or_challenge", "blocked_or_waf", "login_required", "timeout_suspected_antibot"}:
+        recommendation = "目标站点疑似启用了反爬、人机验证或登录墙；建议改用搜索摘要、官方来源或其他可访问来源。"
+    elif issue_type == "js_required":
+        recommendation = "目标页面可能需要浏览器渲染；当前轻量 HTTP 抓取不支持重型浏览器模式，建议换用可访问来源。"
+    elif issue_type == "network_timeout":
+        recommendation = "请求超时；建议稍后重试，或改用搜索摘要和其他来源。"
+    return {
+        "type": issue_type,
+        "confidence": confidence,
+        "signals": signals,
+        "recommendation": recommendation,
+    }
+
+
+def _diagnose_fetch_response(requested_url: str, response: httpx.Response, markdown: str = "") -> dict[str, Any] | None:
+    final_url = str(response.url or requested_url)
+    parsed = urlparse(final_url)
+    host = (parsed.hostname or "").lower()
+    path = (parsed.path or "").lower()
+    status_code = response.status_code
+    text_sample = _safe_response_text(response)
+    title = _extract_html_title(text_sample)
+    haystack = " ".join([final_url, title, text_sample[:3000], markdown[:1000]]).lower()
+    signals: list[str] = []
+
+    if status_code in {401, 403, 429, 503}:
+        _add_signal(signals, f"status_code={status_code}")
+    if status_code == 403:
+        _add_signal(signals, "forbidden")
+    if status_code == 429:
+        _add_signal(signals, "rate_limited")
+    if _domain_matches(host, ANTI_BOT_DOMAINS):
+        _add_signal(signals, f"known anti-bot domain: {host}")
+    for hint in CHALLENGE_PATH_HINTS:
+        if hint in path:
+            _add_signal(signals, f"challenge path: {hint}")
+    for hint in LOGIN_PATH_HINTS:
+        if hint in path:
+            _add_signal(signals, f"login path: {hint}")
+    for keyword in CHALLENGE_KEYWORDS:
+        if keyword.lower() in haystack:
+            _add_signal(signals, f"challenge keyword: {keyword}")
+    for keyword in LOGIN_KEYWORDS:
+        if keyword.lower() in haystack:
+            _add_signal(signals, f"login keyword: {keyword}")
+    for keyword in JS_REQUIRED_KEYWORDS:
+        if keyword.lower() in haystack:
+            _add_signal(signals, f"js keyword: {keyword}")
+
+    if any(signal.startswith("challenge ") for signal in signals):
+        return _diagnostics_response("captcha_or_challenge", "high", signals)
+    if any(signal.startswith("login ") for signal in signals):
+        return _diagnostics_response("login_required", "high", signals)
+    if status_code in {403, 429}:
+        confidence = "high" if _domain_matches(host, ANTI_BOT_DOMAINS) else "medium"
+        return _diagnostics_response("blocked_or_waf", confidence, signals)
+    if status_code in {401}:
+        return _diagnostics_response("login_required", "medium", signals)
+    if any(signal.startswith("js keyword") for signal in signals):
+        return _diagnostics_response("js_required", "medium", signals)
+    if markdown != "" and len(_clean_text(markdown)) < 200 and _domain_matches(host, ANTI_BOT_DOMAINS):
+        _add_signal(signals, f"short extracted content: {len(_clean_text(markdown))} chars")
+        return _diagnostics_response("captcha_or_challenge", "medium", signals)
+    return None
+
+
+def _diagnose_fetch_exception(url: str, exc: Exception) -> dict[str, Any] | None:
+    if isinstance(exc, FetchDiagnosticError):
+        return exc.diagnostics
+    if isinstance(exc, httpx.HTTPStatusError):
+        return _diagnose_fetch_response(url, exc.response)
+    if isinstance(exc, (httpx.ReadTimeout, httpx.TimeoutException)):
+        host = (urlparse(url).hostname or "").lower()
+        signals = [f"{type(exc).__name__}: {exc}"]
+        if _domain_matches(host, ANTI_BOT_DOMAINS):
+            _add_signal(signals, f"known anti-bot domain: {host}")
+            return _diagnostics_response("timeout_suspected_antibot", "medium", signals)
+        return _diagnostics_response("network_timeout", "low", signals)
+    return None
+
+
 def extract_markdown(html: str, base_url: str = "", extract_mode: str = "auto") -> str:
     soup = BeautifulSoup(html, "html.parser")
     for node in soup(["script", "style", "noscript", "template", "svg"]):
@@ -782,6 +948,9 @@ async def fetch_page(
                     )
                     content_type = response.headers.get("content-type", "")
                     markdown_full = _format_response_content(response, extract_mode=extract_mode, config=config)
+                    diagnostics = _diagnose_fetch_response(safe_url, response, markdown=markdown_full)
+                    if diagnostics:
+                        raise FetchDiagnosticError(diagnostics["recommendation"], diagnostics)
                     backend = "direct"
                     status_code: int | None = response.status_code
 
@@ -798,11 +967,21 @@ async def fetch_page(
                 except Exception as exc:
                     if not _cfg(config, "enable_jina_fallback", True):
                         raise
+                    primary_diagnostics = _diagnose_fetch_exception(safe_url, exc)
                     fallback_reason = f"{type(exc).__name__}: {exc}"
-                    jina = await _fetch_jina_reader_markdown(
-                        client,
-                        safe_url,
-                    )
+                    try:
+                        jina = await _fetch_jina_reader_markdown(
+                            client,
+                            safe_url,
+                        )
+                    except Exception as fallback_exc:
+                        if primary_diagnostics:
+                            _add_signal(
+                                primary_diagnostics["signals"],
+                                f"jina_fallback_failed={type(fallback_exc).__name__}: {fallback_exc}",
+                            )
+                            raise FetchDiagnosticError(primary_diagnostics["recommendation"], primary_diagnostics) from fallback_exc
+                        raise
                     markdown_full = jina["markdown"]
                     reader_url = jina["reader_url"]
                     backend = "jina_reader"
@@ -846,12 +1025,17 @@ async def fetch_page(
             result["fallback_reason"] = fallback_reason
         return result
     except Exception as exc:
-        return {
+        diagnostics = _diagnose_fetch_exception(safe_url, exc)
+        result = {
             "ok": False,
             "url": safe_url,
             "fetched_at": now_iso(),
             "error": f"{type(exc).__name__}: {exc}",
         }
+        if diagnostics:
+            result["error_type"] = diagnostics["type"]
+            result["fetch_diagnostics"] = diagnostics
+        return result
 
 
 async def research_brief(
@@ -945,6 +1129,10 @@ async def research_brief(
                 )
             else:
                 source["error"] = fetched.get("error", "fetch failed")
+                if fetched.get("error_type"):
+                    source["error_type"] = fetched.get("error_type")
+                if fetched.get("fetch_diagnostics"):
+                    source["fetch_diagnostics"] = fetched.get("fetch_diagnostics")
             return source
 
     sources = await asyncio.gather(*(fetch_source(result) for result in selected_results))

@@ -612,6 +612,123 @@ def test_jina_reader_still_blocks_private_networks_when_config_allows_them(monke
         asyncio.run(run())
 
 
+def test_diagnose_fetch_response_detects_zhihu_challenge_page():
+    request = httpx.Request("GET", "https://www.zhihu.com/question/19550256")
+    response = httpx.Response(
+        403,
+        content="<html><head><title>安全验证 - 知乎</title></head><body>请完成验证 account/unhuman</body></html>".encode("utf-8"),
+        headers={"content-type": "text/html"},
+        request=request,
+    )
+
+    diagnostics = web._diagnose_fetch_response("https://www.zhihu.com/question/19550256", response)
+
+    assert diagnostics["type"] == "captcha_or_challenge"
+    assert diagnostics["confidence"] == "high"
+    assert "status_code=403" in diagnostics["signals"]
+    assert any("安全验证" in signal for signal in diagnostics["signals"])
+
+
+def test_diagnose_fetch_response_handles_unread_streaming_error_response():
+    request = httpx.Request("GET", "https://www.zhihu.com/question/19550256")
+    response = httpx.Response(
+        403,
+        stream=httpx.ByteStream("<html><title>安全验证 - 知乎</title></html>".encode("utf-8")),
+        request=request,
+    )
+
+    diagnostics = web._diagnose_fetch_response("https://www.zhihu.com/question/19550256", response)
+
+    assert diagnostics["type"] == "blocked_or_waf"
+    assert diagnostics["confidence"] == "high"
+    assert "status_code=403" in diagnostics["signals"]
+
+
+def test_fetch_page_returns_anti_bot_diagnostics_when_direct_fetch_is_blocked(monkeypatch, public_dns):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+
+    async def fake_limited_get(client, url, allow_private_networks=False):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(
+            403,
+            content="<html><head><title>安全验证 - 知乎</title></head><body>请完成验证</body></html>".encode("utf-8"),
+            headers={"content-type": "text/html"},
+            request=request,
+        )
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+
+    result = asyncio.run(web.fetch_page("https://www.zhihu.com/question/19550256", config=Config()))
+
+    assert result["ok"] is False
+    assert result["error_type"] == "captcha_or_challenge"
+    assert result["fetch_diagnostics"]["confidence"] == "high"
+    assert "建议改用搜索摘要" in result["fetch_diagnostics"]["recommendation"]
+
+
+def test_fetch_page_marks_known_site_read_timeout_as_suspected_antibot(monkeypatch, public_dns):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+
+    async def fake_limited_get(client, url, allow_private_networks=False):
+        request = httpx.Request("GET", url)
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+
+    result = asyncio.run(web.fetch_page("https://www.zhihu.com/question/19550256", config=Config()))
+
+    assert result["ok"] is False
+    assert result["error_type"] == "timeout_suspected_antibot"
+    assert result["fetch_diagnostics"]["confidence"] == "medium"
+    assert any("known anti-bot domain" in signal for signal in result["fetch_diagnostics"]["signals"])
+
+
+def test_fetch_page_keeps_direct_anti_bot_diagnostics_when_jina_fallback_fails(monkeypatch, public_dns):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = True
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+
+    async def fake_limited_get(client, url, allow_private_networks=False):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(
+            403,
+            content="<html><head><title>安全验证 - 知乎</title></head><body>请完成验证</body></html>".encode("utf-8"),
+            headers={"content-type": "text/html"},
+            request=request,
+        )
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    async def failing_jina_reader(client, url):
+        request = httpx.Request("GET", "https://r.jina.ai/https://www.zhihu.com/question/19550256")
+        raise httpx.ReadTimeout("jina timed out", request=request)
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+    monkeypatch.setattr(web, "_fetch_jina_reader_markdown", failing_jina_reader, raising=False)
+
+    result = asyncio.run(web.fetch_page("https://www.zhihu.com/question/19550256", config=Config()))
+
+    assert result["ok"] is False
+    assert result["error_type"] == "captcha_or_challenge"
+    assert result["fetch_diagnostics"]["confidence"] == "high"
+
+
 def test_research_brief_returns_compact_sources(monkeypatch, public_dns):
     async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None):
         return {
@@ -697,6 +814,49 @@ def test_research_brief_filters_invalid_urls_before_fetch(monkeypatch, public_dn
         "http://127.0.0.1/admin",
         "file:///C:/Windows/win.ini",
     ]
+
+
+def test_research_brief_propagates_fetch_diagnostics_for_failed_source(monkeypatch, public_dns):
+    class Config:
+        max_brief_sources = 1
+        brief_chars_per_source = 20
+        max_fetch_chars = 60000
+        brief_concurrency = 1
+        dedupe_domains = False
+        allow_private_networks = False
+
+    async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None):
+        return {
+            "ok": True,
+            "query": query,
+            "backend": "duckduckgo_html",
+            "results": [
+                {"title": "Zhihu", "url": "https://www.zhihu.com/question/19550256", "snippet": "snippet"},
+            ],
+        }
+
+    async def fake_fetch_page(url, max_chars=None, start_index=0, extract_mode="auto", config=None):
+        return {
+            "ok": False,
+            "url": url,
+            "error": "HTTPStatusError: forbidden",
+            "error_type": "captcha_or_challenge",
+            "fetch_diagnostics": {
+                "type": "captcha_or_challenge",
+                "confidence": "high",
+                "signals": ["status_code=403"],
+                "recommendation": "目标站点疑似启用了反爬、人机验证或登录墙；建议改用搜索摘要、官方来源或其他可访问来源。",
+            },
+        }
+
+    monkeypatch.setattr(web, "search_web", fake_search_web)
+    monkeypatch.setattr(web, "fetch_page", fake_fetch_page)
+
+    result = asyncio.run(web.research_brief("知乎 test", max_sources=1, max_chars_per_source=20, config=Config()))
+
+    assert result["sources"][0]["ok"] is False
+    assert result["sources"][0]["error_type"] == "captcha_or_challenge"
+    assert result["sources"][0]["fetch_diagnostics"]["confidence"] == "high"
 
 
 def test_research_brief_dedupes_same_domain_results(monkeypatch, public_dns):

@@ -274,6 +274,19 @@ py -3.11 -m pytest .\tests -q
 
 这样模型可以继续拿到可用资料，同时知道当前不是完整的 DuckDuckGo/全球搜索结果。
 
+### 反爬、登录墙和超时
+
+`fetch_url` 不会尝试绕过验证码、登录墙或 WAF。遇到知乎、微信公众号、X、Reddit 等强反爬或强登录站点时，轻量 HTTP 抓取可能返回 `403`、安全验证页、空正文或 `ReadTimeout`。
+
+这类失败会尽量返回结构化诊断：
+
+- `error_type`：例如 `captcha_or_challenge`、`login_required`、`blocked_or_waf`、`js_required`、`timeout_suspected_antibot`、`network_timeout`。
+- `fetch_diagnostics.confidence`：`high` / `medium` / `low`，表示诊断置信度。
+- `fetch_diagnostics.signals`：触发判断的证据，例如 `status_code=403`、`challenge keyword: 安全验证`、`known anti-bot domain: www.zhihu.com`。
+- `fetch_diagnostics.recommendation`：给模型的处理建议，通常是改用搜索摘要、官方来源或其他可访问来源。
+
+`ReadTimeout` 本身不能证明反爬；只有命中已知强反爬域名或其他页面特征时，才会标成 `timeout_suspected_antibot`。如果 Jina Reader fallback 也失败，cc-web 会优先保留原始目标站点的反爬诊断，避免被二次 fallback 的超时错误覆盖。
+
 ### PDF 提取
 
 默认 PDF 会明确拒绝，避免误读二进制内容。若需要读取公开 PDF，可安装可选依赖并开启：
@@ -296,6 +309,7 @@ py -3.11 -m pip install -r requirements-optional.txt
 - 搜索后端可插拔：已支持 `duckduckgo`、`bing_cn` 和 `searxng`，默认按 `duckduckgo -> bing_cn` 降级。
 - `research_brief` 提效：支持同域名去重、并发抓取、失败来源保留错误信息。
 - `research_brief` URL 过滤：搜索结果进入抓取前会过滤非法 URL，并透传搜索后端的 `backend` 字段。
+- 反爬诊断：`fetch_url` 会对 `403/429`、验证页、登录页、JS 依赖页和已知强反爬域名超时返回结构化 `fetch_diagnostics`，`research_brief` 会透传失败来源的诊断信息。
 - 技术资料源轻量加权：默认小幅优先 GitHub、官方文档、包管理站点、Read the Docs、Stack Overflow 等技术来源，但不完全覆盖搜索后端原始排序。
 - 缓存和重复抓取控制：默认开启公开 URL 抓取缓存，TTL 由 `cache_ttl_seconds` 控制，缓存 key 包含 schema version。
 - PDF 可选提取：安装 `requirements-optional.txt` 并开启 `enable_pdf_extract` 后，可用 `pypdf` 提取公开 PDF 文本。
@@ -337,4 +351,5 @@ py -3.11 -m pip install -r requirements-optional.txt
 - 缓存只在 `allow_private_networks: false` 时启用，并且缓存 key 包含 schema version，避免旧格式缓存污染新逻辑。
 - `allow_private_networks: true` 只建议在可信内网文档场景临时开启。
 - 当前不包含 Playwright 或浏览器自动化，不处理重 JavaScript、登录墙、验证码页面。
+- 对疑似反爬页面，cc-web 只做诊断和降级提示，不尝试绕过网站访问控制。
 - 启用 Jina Reader fallback 时，目标 URL 会经过第三方服务；不要用于私密链接或内网页面。
