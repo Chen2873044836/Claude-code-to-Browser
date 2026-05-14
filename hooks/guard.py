@@ -75,13 +75,16 @@ def has_claude_environment_model() -> bool:
     return any(is_claude_model(os.environ.get(name)) for name in MODEL_ENV_NAMES)
 
 
-def deny(reason: str) -> int:
+def deny(reason: str, additional_context: str | None = None) -> int:
+    hook_output = {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }
+    if additional_context:
+        hook_output["additionalContext"] = additional_context
     response = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        },
+        "hookSpecificOutput": hook_output,
     }
     print(json.dumps(response, ensure_ascii=False))
     return 0
@@ -135,14 +138,21 @@ def guard_pre_tool_use(payload: dict[str, Any], state_path: Path, config_path: P
             is_allowed_model = is_allowed_environment(patterns)
         if is_allowed_model:
             reason = (
-                f"{tool_name} 已为当前第三方模型禁用。"
-                "当前模型匹配 cc-web 的 allowed_model_patterns，"
-                "请改用 mcp__cc-web__research_brief 或 mcp__cc-web__web_search 搜索，"
-                "需要读取网页正文时使用 mcp__cc-web__fetch_url。"
-                "如确认该模型的原生 WebSearch/WebFetch 可用，可设置 "
-                "block_native_web_for_allowed_models: false。"
+                f"{tool_name} is disabled for this third-party model. "
+                "Use cc-web MCP instead. Search with mcp__cc-web__research_brief "
+                "or mcp__cc-web__web_search; fetch page content with "
+                "mcp__cc-web__fetch_url."
             )
-            return deny(reason)
+            additional_context = (
+                f"Tool routing instruction: Do not retry {tool_name}. "
+                "The current model matches cc-web allowed_model_patterns, so native "
+                "Claude Code WebSearch/WebFetch is unavailable or unsuitable. "
+                "For web research, call mcp__cc-web__research_brief first. "
+                "If you need raw search results, call mcp__cc-web__web_search. "
+                "If you need to read a specific URL, call mcp__cc-web__fetch_url. "
+                "Continue the task by using cc-web MCP now."
+            )
+            return deny(reason, additional_context)
         return 0
 
     allow_claude_fetch = allow_fetch_url_for_claude(config_path)
@@ -158,13 +168,17 @@ def guard_pre_tool_use(payload: dict[str, Any], state_path: Path, config_path: P
             return 0
 
     reason = (
-        "cc-web MCP 仅允许配置中匹配的模型使用。"
-        f"当前允许模型关键词: {', '.join(patterns)}。"
-        "默认场景是给 DeepSeek 等缺少官方搜索能力的模型补全网页访问。"
-        "官方 Claude 请优先使用原生 WebSearch/WebFetch；"
-        "如确需允许 Claude 使用 cc-web fetch_url，请显式设置 allow_fetch_url_for_claude: true。"
+        "cc-web MCP is only enabled for configured model patterns. "
+        f"Allowed model keywords: {', '.join(patterns)}. "
+        "Official Claude should use native WebSearch/WebFetch. "
+        "To allow Claude to use cc-web fetch_url, set allow_fetch_url_for_claude: true."
     )
-    return deny(reason)
+    additional_context = (
+        "Tool routing instruction: Do not retry this cc-web MCP tool in the current "
+        "model unless the user explicitly asks for cc-web or the configuration allows it. "
+        "Official Claude should use native WebSearch/WebFetch for web access."
+    )
+    return deny(reason, additional_context)
 
 
 def main() -> int:

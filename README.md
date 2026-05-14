@@ -170,6 +170,21 @@ py -3.11 .\scripts\install_hook.py
 
 这样会形成双向守卫：官方 Claude 默认走原生 `WebSearch/WebFetch`；DeepSeek、Qwen、Kimi 等匹配模型默认走 `cc-web`。
 
+守卫输出会同时包含：
+
+- `permissionDecisionReason`：用于权限结果和界面提示。
+- `additionalContext`：注入到模型上下文，明确提示“不要重试 WebSearch/WebFetch，改用 cc-web MCP”。
+
+如果希望进一步减少第三方模型第一次误选原生工具，可以在项目的 `CLAUDE.md` 或 `AGENTS.md` 中加入类似说明：
+
+```markdown
+当当前模型是 DeepSeek、Qwen、Kimi 等第三方模型时，外网搜索和网页抓取优先使用 cc-web MCP：
+- 搜索/概览：mcp__cc-web__research_brief
+- 原始搜索：mcp__cc-web__web_search
+- 读取 URL：mcp__cc-web__fetch_url
+官方 Claude 模型仍优先使用原生 WebSearch/WebFetch。
+```
+
 ## 自动授权
 
 如果不想每次调用 cc-web MCP 都手动确认，可以在 Claude Code 的 `settings.json` 中加入只读 MCP 工具 allow 规则。推荐先使用细粒度写法：

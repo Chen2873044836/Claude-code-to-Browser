@@ -61,7 +61,8 @@ def test_pre_tool_use_blocks_non_deepseek_model(tmp_path):
     output = response["hookSpecificOutput"]
     assert output["hookEventName"] == "PreToolUse"
     assert output["permissionDecision"] == "deny"
-    assert "DeepSeek" in output["permissionDecisionReason"]
+    assert "Allowed model keywords" in output["permissionDecisionReason"]
+    assert "deepseek" in output["permissionDecisionReason"]
 
 
 def test_pre_tool_use_blocks_claude_fetch_url_by_default(tmp_path):
@@ -195,6 +196,9 @@ def test_pre_tool_use_blocks_native_web_search_for_allowed_model_by_default(tmp_
     assert output["permissionDecision"] == "deny"
     assert "cc-web" in output["permissionDecisionReason"]
     assert "research_brief" in output["permissionDecisionReason"]
+    assert "additionalContext" in output
+    assert "mcp__cc-web__research_brief" in output["additionalContext"]
+    assert "Do not retry WebSearch" in output["additionalContext"]
 
 
 def test_pre_tool_use_blocks_native_web_fetch_for_allowed_model_by_default(tmp_path):
@@ -218,6 +222,8 @@ def test_pre_tool_use_blocks_native_web_fetch_for_allowed_model_by_default(tmp_p
     output = response["hookSpecificOutput"]
     assert output["permissionDecision"] == "deny"
     assert "fetch_url" in output["permissionDecisionReason"]
+    assert "mcp__cc-web__fetch_url" in output["additionalContext"]
+    assert "Do not retry WebFetch" in output["additionalContext"]
 
 
 def test_pre_tool_use_allows_native_web_for_allowed_model_when_disabled(tmp_path):
