@@ -219,7 +219,7 @@ def test_pre_tool_use_blocks_native_web_fetch_for_allowed_model_by_default(tmp_p
     assert "Do not retry WebFetch" in output["additionalContext"]
 
 
-def test_pre_tool_use_allows_native_web_for_allowed_model_when_disabled(tmp_path):
+def test_pre_tool_use_allows_native_web_fetch_for_allowed_model_when_disabled(tmp_path):
     state = tmp_path / "state.json"
     config = tmp_path / "config.json"
     state.write_text(json.dumps({"s1": {"model": "deepseek-v4-flash"}}), encoding="utf-8")
@@ -238,7 +238,7 @@ def test_pre_tool_use_allows_native_web_for_allowed_model_when_disabled(tmp_path
         {
             "hook_event_name": "PreToolUse",
             "session_id": "s1",
-            "tool_name": "WebSearch",
+            "tool_name": "WebFetch",
         },
         config_path=config,
     )
@@ -247,7 +247,7 @@ def test_pre_tool_use_allows_native_web_for_allowed_model_when_disabled(tmp_path
     assert result.stdout.strip() == ""
 
 
-def test_pre_tool_use_allows_native_web_search_for_claude_model(tmp_path):
+def test_pre_tool_use_allows_native_web_fetch_for_claude_model(tmp_path):
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"s1": {"model": "claude-opus-4-6"}}), encoding="utf-8")
 
@@ -256,7 +256,7 @@ def test_pre_tool_use_allows_native_web_search_for_claude_model(tmp_path):
         {
             "hook_event_name": "PreToolUse",
             "session_id": "s1",
-            "tool_name": "WebSearch",
+            "tool_name": "WebFetch",
         },
     )
 
@@ -283,7 +283,7 @@ def test_pre_tool_use_does_not_block_native_web_search_for_allowed_environment(t
     assert result.stdout.strip() == ""
 
 
-def test_pre_tool_use_uses_recorded_model_before_environment_for_native_web(tmp_path):
+def test_pre_tool_use_uses_recorded_model_before_environment_for_native_web_fetch(tmp_path):
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"s1": {"model": "claude-opus-4-6"}}), encoding="utf-8")
     env = {**os.environ, "ANTHROPIC_MODEL": "deepseek-v4-pro[1m]"}
@@ -293,7 +293,7 @@ def test_pre_tool_use_uses_recorded_model_before_environment_for_native_web(tmp_
         {
             "hook_event_name": "PreToolUse",
             "session_id": "s1",
-            "tool_name": "WebSearch",
+            "tool_name": "WebFetch",
         },
         env=env,
     )

@@ -332,7 +332,8 @@ def test_check_health_reports_configured_search_provider_chain(monkeypatch, tmp_
     config_path.write_text(
         """
         {
-          "search_providers": ["duckduckgo", "bing_cn"]
+          "search_providers": ["duckduckgo", "bing_cn"],
+          "block_native_web_for_allowed_models": false
         }
         """,
         encoding="utf-8",
@@ -363,6 +364,7 @@ def test_check_health_reports_configured_search_provider_chain(monkeypatch, tmp_
     health = asyncio.run(web.check_health())
 
     assert health["search_providers"] == ["duckduckgo", "bing_cn"]
+    assert health["config"]["block_native_web_for_allowed_models"] is False
     assert health["search_backend_status"]["duckduckgo"]["ok"] is False
     assert health["search_backend_status"]["bing_cn"] == {"ok": True, "status": 200}
     assert health["first_available_search_backend"] == "bing_cn"

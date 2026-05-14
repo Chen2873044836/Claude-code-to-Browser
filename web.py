@@ -154,6 +154,7 @@ class GlobalWebConfig:
     search_provider: str = "duckduckgo"
     search_providers: tuple[str, ...] = ("duckduckgo", "bing_cn")
     allow_fetch_url_for_claude: bool = False
+    block_native_web_for_allowed_models: bool = True
     searxng_base_url: str = ""
     prefer_technical_sources: bool = True
     default_fetch_chars: int = 10_000
@@ -233,6 +234,7 @@ def load_config(path: str | Path | None = None) -> GlobalWebConfig:
         search_provider=_normalize_search_provider_name(raw.get("search_provider") or "duckduckgo"),
         search_providers=_normalize_search_providers(raw.get("search_providers"), raw.get("search_provider") or "duckduckgo"),
         allow_fetch_url_for_claude=bool(raw.get("allow_fetch_url_for_claude", False)),
+        block_native_web_for_allowed_models=bool(raw.get("block_native_web_for_allowed_models", True)),
         searxng_base_url=str(raw.get("searxng_base_url") or "").strip().rstrip("/"),
         prefer_technical_sources=bool(raw.get("prefer_technical_sources", True)),
         default_fetch_chars=_bounded_int(raw.get("default_fetch_chars"), 10_000, 1_000, 60_000),
@@ -257,6 +259,7 @@ def config_to_dict(config: GlobalWebConfig) -> dict[str, Any]:
         "search_provider": config.search_provider,
         "search_providers": list(config.search_providers),
         "allow_fetch_url_for_claude": config.allow_fetch_url_for_claude,
+        "block_native_web_for_allowed_models": config.block_native_web_for_allowed_models,
         "searxng_base_url": config.searxng_base_url,
         "prefer_technical_sources": config.prefer_technical_sources,
         "default_fetch_chars": config.default_fetch_chars,
