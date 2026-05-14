@@ -207,6 +207,39 @@ def test_search_web_falls_back_to_bing_cn_when_duckduckgo_fails(monkeypatch):
     assert result["results"][0]["url"] == "https://github.com/modelcontextprotocol/servers"
 
 
+def test_search_web_all_provider_failure_guides_model_away_from_immediate_retry(monkeypatch):
+    class Config:
+        search_provider = "duckduckgo"
+        search_providers = ("duckduckgo", "bing_cn")
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            raise httpx.ConnectError("blocked", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=2, config=Config()))
+
+    assert result["ok"] is False
+    assert result["retryable"] is True
+    assert "same search" in result["do_not_retry_reason"]
+    assert "health_check" in result["recommended_next_action"]
+    assert result["attempted_backends"][0]["backend"] == "duckduckgo_html"
+    assert result["attempted_backends"][1]["backend"] == "bing_cn"
+
+
 def test_load_config_keeps_ordered_search_providers(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -429,6 +462,35 @@ def test_fetch_page_returns_paginated_window_metadata(monkeypatch, public_dns):
     assert result["next_start_index"] == 6
 
 
+def test_fetch_page_returns_continuation_guidance_for_truncated_content(monkeypatch, public_dns):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+
+    async def fake_limited_get(client, url, allow_private_networks=False):
+        return httpx.Response(
+            200,
+            content=b"<html><body><main><p>abcdefghij</p></main></body></html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+
+    result = asyncio.run(web.fetch_page("https://example.com/doc", max_chars=4, start_index=0, config=Config()))
+
+    assert result["ok"] is True
+    assert result["markdown"] == "abcd"
+    assert result["truncation"]["remaining_chars"] == 6
+    assert result["truncation"]["next_call"]["tool"] == "fetch_url"
+    assert result["truncation"]["next_call"]["start_index"] == 4
+    assert "Do not repeat" in result["truncation"]["do_not_retry_reason"]
+
+
 def test_fetch_page_formats_json_content(monkeypatch, public_dns):
     class Config:
         default_fetch_chars = 1000
@@ -478,6 +540,16 @@ def test_fetch_page_rejects_pdf_content(monkeypatch, public_dns):
 
     assert result["ok"] is False
     assert "PDF" in result["error"]
+
+
+def test_fetch_page_safety_error_guides_model_to_fix_url():
+    result = asyncio.run(web.fetch_page("mailto:reader@example.com"))
+
+    assert result["ok"] is False
+    assert result["error_type"] == "fetch_safety"
+    assert result["retryable"] is False
+    assert "safety policy" in result["do_not_retry_reason"]
+    assert "http/https" in result["recommended_next_action"]
 
 
 def test_fetch_page_extracts_pdf_when_enabled(monkeypatch, public_dns):
@@ -728,6 +800,9 @@ def test_fetch_page_returns_anti_bot_diagnostics_when_direct_fetch_is_blocked(mo
     assert result["ok"] is False
     assert result["error_type"] == "captcha_or_challenge"
     assert result["fetch_diagnostics"]["confidence"] == "high"
+    assert result["retryable"] is False
+    assert "captcha_or_challenge" in result["do_not_retry_reason"]
+    assert result["recommended_next_action"] == result["fetch_diagnostics"]["recommendation"]
     assert "建议改用搜索摘要" in result["fetch_diagnostics"]["recommendation"]
 
 
@@ -752,6 +827,31 @@ def test_fetch_page_marks_known_site_read_timeout_as_suspected_antibot(monkeypat
     assert result["error_type"] == "timeout_suspected_antibot"
     assert result["fetch_diagnostics"]["confidence"] == "medium"
     assert any("known anti-bot domain" in signal for signal in result["fetch_diagnostics"]["signals"])
+    assert result["retryable"] is False
+
+
+def test_fetch_page_marks_plain_network_timeout_retryable(monkeypatch, public_dns):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+
+    async def fake_limited_get(client, url, allow_private_networks=False):
+        request = httpx.Request("GET", url)
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+
+    result = asyncio.run(web.fetch_page("https://example.com/slow", config=Config()))
+
+    assert result["ok"] is False
+    assert result["error_type"] == "network_timeout"
+    assert result["retryable"] is True
+    assert result["retry_after_seconds"] == 30
+    assert result["recommended_next_action"]
 
 
 def test_fetch_page_keeps_direct_anti_bot_diagnostics_when_jina_fallback_fails(monkeypatch, public_dns):
@@ -809,6 +909,15 @@ def test_research_brief_returns_compact_sources(monkeypatch, public_dns):
             "content_length": 50,
             "truncated": True,
             "next_start_index": 20,
+            "truncation": {
+                "remaining_chars": 30,
+                "next_call": {
+                    "url": url,
+                    "max_chars": 20,
+                    "start_index": 20,
+                    "extract_mode": "auto",
+                },
+            },
         }
 
     monkeypatch.setattr(web, "search_web", fake_search_web)
@@ -823,6 +932,7 @@ def test_research_brief_returns_compact_sources(monkeypatch, public_dns):
     assert result["sources"][0]["title"] == "Doc A"
     assert result["sources"][0]["markdown"] == "x" * 20
     assert result["sources"][0]["truncated"] is True
+    assert result["sources"][0]["truncation"]["next_call"]["start_index"] == 20
 
 
 def test_research_brief_filters_invalid_urls_before_fetch(monkeypatch, public_dns):
@@ -915,6 +1025,47 @@ def test_research_brief_propagates_fetch_diagnostics_for_failed_source(monkeypat
     assert result["sources"][0]["ok"] is False
     assert result["sources"][0]["error_type"] == "captcha_or_challenge"
     assert result["sources"][0]["fetch_diagnostics"]["confidence"] == "high"
+
+
+def test_research_brief_propagates_retry_guidance_for_failed_source(monkeypatch, public_dns):
+    class Config:
+        max_brief_sources = 1
+        brief_chars_per_source = 20
+        max_fetch_chars = 60000
+        brief_concurrency = 1
+        dedupe_domains = False
+        allow_private_networks = False
+
+    async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None):
+        return {
+            "ok": True,
+            "query": query,
+            "backend": "duckduckgo_html",
+            "results": [
+                {"title": "Blocked", "url": "https://blocked.example/doc", "snippet": "snippet"},
+            ],
+        }
+
+    async def fake_fetch_page(url, max_chars=None, start_index=0, extract_mode="auto", config=None):
+        return {
+            "ok": False,
+            "url": url,
+            "error": "HTTPStatusError: forbidden",
+            "error_type": "blocked_or_waf",
+            "retryable": False,
+            "do_not_retry_reason": "Target returned blocked_or_waf; repeating fetch_url with the same URL is unlikely to help.",
+            "recommended_next_action": "Use search summaries or another accessible source.",
+        }
+
+    monkeypatch.setattr(web, "search_web", fake_search_web)
+    monkeypatch.setattr(web, "fetch_page", fake_fetch_page)
+
+    result = asyncio.run(web.research_brief("blocked doc", max_sources=1, max_chars_per_source=20, config=Config()))
+
+    assert result["sources"][0]["ok"] is False
+    assert result["sources"][0]["retryable"] is False
+    assert "same URL" in result["sources"][0]["do_not_retry_reason"]
+    assert result["sources"][0]["recommended_next_action"] == "Use search summaries or another accessible source."
 
 
 def test_research_brief_dedupes_same_domain_results(monkeypatch, public_dns):

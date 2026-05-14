@@ -598,6 +598,37 @@ def _diagnostics_response(
     }
 
 
+def _fetch_failure_guidance(error_type: str, recommendation: str | None = None) -> dict[str, Any]:
+    if error_type == "network_timeout":
+        return {
+            "retryable": True,
+            "retry_after_seconds": 30,
+            "do_not_retry_reason": "Transient timeout; do not repeat immediately with the same URL.",
+            "recommended_next_action": recommendation
+            or "Retry later, run health_check if failures persist, or use research_brief/search results.",
+        }
+
+    if error_type == "fetch_safety":
+        return {
+            "retryable": False,
+            "do_not_retry_reason": "Blocked by fetch safety policy; do not retry the same URL.",
+            "recommended_next_action": recommendation or "Use an absolute http/https URL from a public source.",
+        }
+
+    if error_type in {"captcha_or_challenge", "blocked_or_waf", "login_required", "timeout_suspected_antibot", "js_required"}:
+        return {
+            "retryable": False,
+            "do_not_retry_reason": f"Target returned {error_type}; repeating fetch_url with the same URL is unlikely to help.",
+            "recommended_next_action": recommendation or "Use search summaries, official sources, or another accessible source.",
+        }
+
+    return {
+        "retryable": False,
+        "do_not_retry_reason": "Fetch failed; do not repeat the identical call unless the URL or parameters change.",
+        "recommended_next_action": recommendation or "Try research_brief, use another source, or narrow the request.",
+    }
+
+
 def _diagnose_fetch_response(requested_url: str, response: httpx.Response, markdown: str = "") -> dict[str, Any] | None:
     final_url = str(response.url or requested_url)
     parsed = urlparse(final_url)
@@ -691,6 +722,24 @@ def slice_text_window(text: str, max_chars: int, start_index: int = 0) -> dict[s
         "returned_range": {"start": start, "end": end},
         "truncated": truncated,
         "next_start_index": end if truncated else None,
+    }
+
+
+def _truncation_guidance(url: str, max_chars: int, extract_mode: str, window: dict[str, Any]) -> dict[str, Any] | None:
+    if not window.get("truncated"):
+        return None
+    next_start = window.get("next_start_index")
+    remaining = max(0, int(window.get("content_length", 0)) - int(next_start or 0))
+    return {
+        "remaining_chars": remaining,
+        "do_not_retry_reason": "Do not repeat fetch_url with the same start_index; continue from next_start_index.",
+        "next_call": {
+            "tool": "fetch_url",
+            "url": url,
+            "max_chars": max_chars,
+            "start_index": next_start,
+            "extract_mode": extract_mode,
+        },
     }
 
 
@@ -842,7 +891,15 @@ async def search_web(
     config = config or load_config()
     query = _clean_text(query)
     if not query:
-        return {"ok": False, "error": "query 不能为空", "results": []}
+        return {
+            "ok": False,
+            "error": "query 不能为空",
+            "error_type": "invalid_query",
+            "retryable": False,
+            "do_not_retry_reason": "Empty query; do not retry until a non-empty query is provided.",
+            "recommended_next_action": "Provide a concise search query.",
+            "results": [],
+        }
 
     max_results = max(1, min(int(max_results or 5), config.max_search_results))
     providers = _normalize_search_providers(
@@ -889,6 +946,10 @@ async def search_web(
         "error": last_error or "all search providers failed",
         "fallback_reason": fallback_reason,
         "attempted_backends": attempted_backends,
+        "retryable": True,
+        "retry_after_seconds": 30,
+        "do_not_retry_reason": "All configured search backends failed; do not repeat the same search immediately.",
+        "recommended_next_action": "Run health_check to inspect search backends, retry later, or change search_providers.",
         "results": [],
     }
 
@@ -904,7 +965,14 @@ async def fetch_page(
     try:
         safe_url = await validate_fetch_url_async(url, allow_private_networks=_cfg(config, "allow_private_networks", False))
     except FetchSafetyError as exc:
-        return {"ok": False, "url": url, "error": str(exc)}
+        result = {
+            "ok": False,
+            "url": url,
+            "error": str(exc),
+            "error_type": "fetch_safety",
+        }
+        result.update(_fetch_failure_guidance("fetch_safety"))
+        return result
 
     max_chars = max(1, min(int(max_chars or _cfg(config, "default_fetch_chars", 10_000)), _cfg(config, "max_fetch_chars", 60_000)))
     fallback_reason = ""
@@ -1012,18 +1080,23 @@ async def fetch_page(
             result["reader_url"] = reader_url
         if fallback_reason:
             result["fallback_reason"] = fallback_reason
+        truncation = _truncation_guidance(safe_url, max_chars, extract_mode, window)
+        if truncation:
+            result["truncation"] = truncation
         return result
     except Exception as exc:
         diagnostics = _diagnose_fetch_exception(safe_url, exc)
+        error_type = diagnostics["type"] if diagnostics else "fetch_failed"
         result = {
             "ok": False,
             "url": safe_url,
             "fetched_at": now_iso(),
             "error": f"{type(exc).__name__}: {exc}",
+            "error_type": error_type,
         }
         if diagnostics:
-            result["error_type"] = diagnostics["type"]
             result["fetch_diagnostics"] = diagnostics
+        result.update(_fetch_failure_guidance(error_type, diagnostics.get("recommendation") if diagnostics else None))
         return result
 
 
@@ -1116,12 +1189,17 @@ async def research_brief(
                         "next_start_index": fetched.get("next_start_index"),
                     }
                 )
+                if fetched.get("truncation"):
+                    source["truncation"] = fetched["truncation"]
             else:
                 source["error"] = fetched.get("error", "fetch failed")
                 if fetched.get("error_type"):
                     source["error_type"] = fetched.get("error_type")
                 if fetched.get("fetch_diagnostics"):
                     source["fetch_diagnostics"] = fetched.get("fetch_diagnostics")
+                for key in ("retryable", "retry_after_seconds", "do_not_retry_reason", "recommended_next_action"):
+                    if key in fetched:
+                        source[key] = fetched[key]
             return source
 
     sources = await asyncio.gather(*(fetch_source(result) for result in selected_results))
