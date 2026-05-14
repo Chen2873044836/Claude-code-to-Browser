@@ -57,6 +57,18 @@ py -3.11 .\scripts\doctor.py
 py -3.11 .\scripts\doctor.py --json --skip-network
 ```
 
+## 第一次验证建议
+
+安装完成后，建议先用第三方模型在 Claude Code 里做一次小范围联网任务，确认路由是否生效：
+
+```text
+使用 cc-web 查询 “Claude Code MCP PreToolUse hook permissionDecision”，先用 research_brief 获取资料概览，再总结当前推荐写法。
+```
+
+如果模型仍尝试调用原生 `WebSearch`，说明启动指令可能没有生效，先检查 `~\.claude\CLAUDE.md`。如果模型尝试调用原生 `WebFetch` 并被拦截，说明 hook 已生效；模型应根据提示改用 `cc-web fetch_url`。
+
+建议优先让模型调用 `research_brief`，只有某个来源确实关键时，再用 `fetch_url` 单独读取完整页面。
+
 ## 基础配置
 
 编辑 `config.json`：
