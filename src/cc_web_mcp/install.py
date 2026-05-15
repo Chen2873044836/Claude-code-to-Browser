@@ -160,10 +160,11 @@ def is_cc_web_guard_command(command: Any) -> bool:
         tokens = shlex.split(normalized)
     except ValueError:
         tokens = normalized.split()
-    if not tokens or tokens[-1] != "hook-guard":
+    if not tokens or "hook-guard" not in tokens:
         return False
 
-    return any(_is_cc_web_console_token(token) for token in tokens[:-1])
+    hook_index = tokens.index("hook-guard")
+    return any(_is_cc_web_console_token(token) for token in tokens[:hook_index])
 
 
 def _is_cc_web_console_token(token: str) -> bool:

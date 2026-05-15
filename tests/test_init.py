@@ -305,6 +305,41 @@ def test_install_hooks_use_module_command(tmp_path):
     assert "hooks/guard.py" not in command.replace("\\", "/")
 
 
+def test_merge_hook_replaces_existing_uvx_guard_entry():
+    data = {
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": "^(mcp__cc[-_]web__.*|WebFetch)$",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "uvx cc-web-mcp==0.1.2 hook-guard",
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    changed = install.merge_hook(
+        data,
+        "PreToolUse",
+        "^(mcp__cc[-_]web__.*|WebFetch)$",
+        "uvx 'cc-web-mcp[pdf]' hook-guard",
+        force=True,
+    )
+
+    assert changed is True
+    entries = data["hooks"]["PreToolUse"]
+    assert len(entries) == 1
+    assert entries[0]["hooks"][0]["command"] == "uvx 'cc-web-mcp[pdf]' hook-guard"
+
+
+def test_guard_command_recognizes_hook_guard_with_extra_arguments():
+    assert install.is_cc_web_guard_command("uvx cc-web-mcp hook-guard --config C:/tmp/config.json")
+
+
 def test_force_install_hooks_replaces_console_script_guard_commands(tmp_path, monkeypatch):
     monkeypatch.setattr(install, "resolve_uvx_command", lambda: "uvx")
     settings = tmp_path / "settings.json"
