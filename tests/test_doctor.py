@@ -378,9 +378,13 @@ def test_build_report_runs_network_check_when_not_skipped(tmp_path, monkeypatch)
             "search_backend_status": {"bing_cn": {"ok": True}},
         }, []
 
-    monkeypatch.setattr(doctor, "_check_network", fake_network_check, raising=False)
+    def fail_if_mcp_registration_is_checked():
+        raise AssertionError("test must not depend on local Claude MCP registration")
 
-    report = doctor.build_report(config, claude_memory, settings, skip_network=False)
+    monkeypatch.setattr(doctor, "_check_network", fake_network_check, raising=False)
+    monkeypatch.setattr(doctor, "_check_mcp_registration", fail_if_mcp_registration_is_checked)
+
+    report = doctor.build_report(config, claude_memory, settings, skip_network=False, skip_mcp_registration=True)
 
     assert calls == [config]
     assert report["ok"] is True

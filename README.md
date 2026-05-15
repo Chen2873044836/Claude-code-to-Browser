@@ -32,6 +32,8 @@ uvx cc-web-mcp init --runner uvx
 uvx cc-web-mcp doctor
 ```
 
+如果之前已经用普通 `pip`、editable install 或旧的 uv 缓存路径初始化过，切换到 `uvx` 后请重新运行 `uvx cc-web-mcp init --runner uvx --force`，刷新 Claude Code 里保存的 MCP 命令路径。
+
 `cc-web-mcp init` 是推荐的首次初始化入口。它会：
 
 - 创建用户配置文件。

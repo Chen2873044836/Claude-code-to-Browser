@@ -72,7 +72,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cc-web-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Claude Code MCP web search and fetch tools for third-party models."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -80,7 +80,6 @@ dependencies = [
   "mcp",
   "httpx",
   "beautifulsoup4",
-  "lxml",
   "markdownify",
 ]
 

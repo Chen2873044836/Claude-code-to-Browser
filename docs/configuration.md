@@ -134,7 +134,7 @@ cc-web-mcp config init
 默认 PDF 会明确拒绝，避免误读二进制内容。若需要读取公开 PDF，可安装可选依赖并开启：
 
 ```powershell
-py -3.11 -m pip install -r requirements-optional.txt
+py -3.11 -m pip install "cc-web-mcp[pdf]"
 ```
 
 ```json

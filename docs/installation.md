@@ -29,6 +29,7 @@ uvx cc-web-mcp doctor
 ```
 
 `--runner uvx` 很重要：它会把 Claude Code MCP 注册成 `uvx cc-web-mcp`，避免把 uvx 临时缓存目录里的 `python.exe` 写进长期配置。
+如果之前已经用普通 `pip`、editable install 或旧的 uv 缓存路径初始化过，切换到 `uvx` 后请重新运行 `uvx cc-web-mcp init --runner uvx --force`，刷新 Claude Code 里保存的 MCP 命令路径。
 
 ### pipx 或 pip 安装
 

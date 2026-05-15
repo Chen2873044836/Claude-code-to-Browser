@@ -1,20 +1,54 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "cc-web-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Claude Code MCP web search and fetch tools for third-party models."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "JcDizzy" },
+]
+keywords = ["claude-code", "mcp", "web-search", "web-fetch", "deepseek"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Natural Language :: Chinese (Simplified)",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
   "mcp",
   "httpx",
   "beautifulsoup4",
-  "lxml",
   "markdownify",
 ]
+
+[project.optional-dependencies]
+pdf = [
+  "pypdf",
+]
+dev = [
+  "build",
+  "pytest",
+  "twine",
+]
+
+[project.urls]
+Homepage = "https://github.com/JcDizzy/CC-Web-MCP"
+Repository = "https://github.com/JcDizzy/CC-Web-MCP"
+Issues = "https://github.com/JcDizzy/CC-Web-MCP/issues"
+Documentation = "https://github.com/JcDizzy/CC-Web-MCP/tree/main/docs"
 
 [project.scripts]
 cc-web-mcp = "cc_web_mcp.cli:main"
