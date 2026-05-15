@@ -119,6 +119,37 @@ def test_init_uvx_runner_supports_custom_package_spec(tmp_path, monkeypatch):
     assert summary["uvx_package"] == "cc-web-mcp==0.1.0"
 
 
+def test_init_uvx_runner_with_pdf_registers_pdf_extra(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(list(command))
+
+        class Result:
+            returncode = 0
+            stdout = "ok"
+            stderr = ""
+
+        return Result()
+
+    monkeypatch.setattr(install.subprocess, "run", fake_run)
+    monkeypatch.setattr(install.shutil, "which", lambda name: "uvx" if name == "uvx" else None)
+
+    summary = install.run_init(
+        config_path=tmp_path / "config.json",
+        memory_path=tmp_path / "CLAUDE.md",
+        settings_path=tmp_path / "settings.json",
+        runner="uvx",
+        with_pdf=True,
+    )
+
+    assert calls[0][-2:] == ["uvx", "cc-web-mcp[pdf]"]
+    settings = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
+    hook_command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert hook_command == "uvx 'cc-web-mcp[pdf]' hook-guard"
+    assert summary["uvx_package"] == "cc-web-mcp[pdf]"
+
+
 def test_uvx_hook_command_normalizes_windows_launcher_path(monkeypatch):
     monkeypatch.setattr(install.os, "name", "nt")
     monkeypatch.setattr(install.shutil, "which", lambda name: r"C:\Program Files\uv\uvx.exe" if name == "uvx.exe" else None)

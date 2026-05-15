@@ -133,6 +133,14 @@ cc-web-mcp config init
 
 默认 PDF 会明确拒绝，避免误读二进制内容。若需要读取公开 PDF，可安装可选依赖并开启：
 
+推荐 uvx 场景直接刷新 Claude Code 注册命令：
+
+```powershell
+uvx cc-web-mcp init --runner uvx --with-pdf --force
+```
+
+普通 pip 环境可安装 PyPI extra：
+
 ```powershell
 py -3.11 -m pip install "cc-web-mcp[pdf]"
 ```

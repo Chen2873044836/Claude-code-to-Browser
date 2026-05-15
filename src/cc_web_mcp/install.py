@@ -93,6 +93,13 @@ def build_uvx_tool_command(uvx_package: str = "cc-web-mcp") -> list[str]:
     return [resolve_uvx_command(), package]
 
 
+def resolve_uvx_package(uvx_package: str = "cc-web-mcp", with_pdf: bool = False) -> str:
+    package = (uvx_package or "").strip() or "cc-web-mcp"
+    if with_pdf and package == "cc-web-mcp":
+        return "cc-web-mcp[pdf]"
+    return package
+
+
 def build_guard_command(python_command: str | None = None) -> str:
     python_command = python_command or default_python_command()
     return f"{_format_python_command(python_command)} -m cc_web_mcp.hooks.guard"
@@ -100,7 +107,7 @@ def build_guard_command(python_command: str | None = None) -> str:
 
 def build_uvx_guard_command(uvx_package: str = "cc-web-mcp") -> str:
     command = build_uvx_tool_command(uvx_package)
-    return " ".join([_format_python_command(command[0]), *command[1:], "hook-guard"])
+    return " ".join([_format_python_command(command[0]), *(_quote_shell(part) for part in command[1:]), "hook-guard"])
 
 
 def build_hook_command(runner: str = "python", python_command: str | None = None, uvx_package: str = "cc-web-mcp") -> str:
@@ -302,9 +309,11 @@ def build_init_summary(
     scope: str = "user",
     runner: str = "python",
     uvx_package: str = "cc-web-mcp",
+    with_pdf: bool = False,
 ) -> dict[str, Any]:
     resolved_config = resolve_config_path(config_path)
     config_created = not resolved_config.exists()
+    resolved_uvx_package = resolve_uvx_package(uvx_package, with_pdf=with_pdf)
 
     actions: list[dict[str, Any]] = []
     if not skip_instructions:
@@ -315,7 +324,7 @@ def build_init_summary(
         actions.append(
             {
                 "kind": "claude_mcp_add",
-                "command": build_claude_mcp_add_command(scope=scope, runner=runner, uvx_package=uvx_package),
+                "command": build_claude_mcp_add_command(scope=scope, runner=runner, uvx_package=resolved_uvx_package),
             }
         )
 
@@ -326,9 +335,10 @@ def build_init_summary(
         "dry_run": dry_run,
         "force": force,
         "runner": runner,
-        "uvx_package": uvx_package,
+        "uvx_package": resolved_uvx_package,
+        "with_pdf": with_pdf,
         "mcp_registered": None,
-        "mcp_registration_command": " ".join(build_claude_mcp_add_command(scope=scope, runner=runner, uvx_package=uvx_package)),
+        "mcp_registration_command": " ".join(build_claude_mcp_add_command(scope=scope, runner=runner, uvx_package=resolved_uvx_package)),
     }
 
 
@@ -354,6 +364,7 @@ def run_init(
     scope: str = "user",
     runner: str = "python",
     uvx_package: str = "cc-web-mcp",
+    with_pdf: bool = False,
 ) -> dict[str, Any]:
     summary = build_init_summary(
         config_path=config_path,
@@ -368,7 +379,9 @@ def run_init(
         scope=scope,
         runner=runner,
         uvx_package=uvx_package,
+        with_pdf=with_pdf,
     )
+    resolved_uvx_package = summary["uvx_package"]
 
     memory_target = memory_path or default_memory_path()
     settings_target = settings_path or default_settings_path()
@@ -391,13 +404,13 @@ def run_init(
             python_command,
             force=force,
             runner=runner,
-            uvx_package=uvx_package,
+            uvx_package=resolved_uvx_package,
         )
         summary["hooks_changed"] = changed
         summary["hooks_backup"] = str(backup_path) if backup_path else None
 
     if not skip_mcp:
-        registered, command, stdout, stderr = register_claude_mcp(scope=scope, runner=runner, uvx_package=uvx_package)
+        registered, command, stdout, stderr = register_claude_mcp(scope=scope, runner=runner, uvx_package=resolved_uvx_package)
         summary["mcp_registered"] = registered
         summary["mcp_registration_command"] = " ".join(command)
         summary["mcp_stdout"] = stdout
@@ -457,6 +470,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scope", default="user")
     parser.add_argument("--runner", choices=("python", "uvx"), default="python")
     parser.add_argument("--uvx-package", default="cc-web-mcp")
+    parser.add_argument("--with-pdf", action="store_true", help="When using --runner uvx, register cc-web-mcp with the pdf extra.")
     args = parser.parse_args(argv)
 
     try:
@@ -473,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
             scope=args.scope,
             runner=args.runner,
             uvx_package=args.uvx_package,
+            with_pdf=args.with_pdf,
         )
     except RuntimeError as exc:
         print(str(exc))

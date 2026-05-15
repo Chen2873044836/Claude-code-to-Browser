@@ -16,6 +16,12 @@ uvx cc-web-mcp doctor
 `--runner uvx` 很重要：它会把 Claude Code MCP 注册成 `uvx cc-web-mcp`，避免把 uvx 临时缓存目录里的 `python.exe` 写进长期配置。
 如果之前已经用普通 `pip`、editable install 或旧的 uv 缓存路径初始化过，切换到 `uvx` 后请重新运行 `uvx cc-web-mcp init --runner uvx --force`，刷新 Claude Code 里保存的 MCP 命令路径。
 
+如果需要 PDF 提取能力，初始化时加 `--with-pdf`，Claude Code 保存的命令会使用 `cc-web-mcp[pdf]`：
+
+```powershell
+uvx cc-web-mcp init --runner uvx --with-pdf --force
+```
+
 ### 备选：pipx 或 pip
 
 如果所在环境不能使用 `uvx`，也可以使用 `pipx`：
@@ -91,6 +97,12 @@ cc-web-mcp init --skip-mcp
 
 ```powershell
 uvx cc-web-mcp init --runner uvx --force
+```
+
+刷新为带 PDF 可选依赖的 uvx 注册：
+
+```powershell
+uvx cc-web-mcp init --runner uvx --with-pdf --force
 ```
 
 ## 本地诊断

@@ -58,7 +58,7 @@
 - HTML：清理后转 Markdown。
 - 纯文本和 Markdown：直接清洗。
 - JSON：格式化后返回。
-- PDF：默认拒绝；安装 `cc-web-mcp[pdf]` 并开启 `enable_pdf_extract` 后，可用 `pypdf` 提取公开 PDF 文本。
+- PDF：默认拒绝；uvx 场景运行 `uvx cc-web-mcp init --runner uvx --with-pdf --force`，并开启 `enable_pdf_extract` 后，可用 `pypdf` 提取公开 PDF 文本；pip 环境可安装 `cc-web-mcp[pdf]`。
 
 ## 链接与缓存
 

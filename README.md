@@ -49,6 +49,12 @@ py -3.11 -m cc_web_mcp doctor
 
 `pipx` 或普通 `pip` 也可以用，但不作为首选路径；如果 `pip install` 提示 `cc-web-mcp.exe` 所在目录不在 `PATH`，可以继续使用 `py -3.11 -m cc_web_mcp ...` 形式运行。
 
+如果需要让 Claude Code 中长期注册的 uvx 命令支持 PDF 提取，初始化时加 `--with-pdf`：
+
+```powershell
+uvx cc-web-mcp init --runner uvx --with-pdf --force
+```
+
 先看计划、不写文件：
 
 ```powershell

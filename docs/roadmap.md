@@ -19,7 +19,7 @@
 - 本地诊断：`cc-web-mcp doctor` 可检查配置文件、Claude Code 指令、hook 守卫和搜索后端连通性是否就位。
 - 技术资料源轻量加权：默认小幅优先 GitHub、官方文档、包管理站点、Read the Docs、Stack Overflow 等技术来源，但不完全覆盖搜索后端原始排序。
 - 缓存和重复抓取控制：默认开启公开 URL 抓取缓存，TTL 由 `cache_ttl_seconds` 控制，缓存 key 包含 schema version。
-- PDF 可选提取：安装 `cc-web-mcp[pdf]` 并开启 `enable_pdf_extract` 后，可用 `pypdf` 提取公开 PDF 文本。
+- PDF 可选提取：uvx 场景可通过 `uvx cc-web-mcp init --runner uvx --with-pdf --force` 注册 `cc-web-mcp[pdf]`，开启 `enable_pdf_extract` 后可用 `pypdf` 提取公开 PDF 文本。
 
 ## 后续计划
 
