@@ -1,27 +1,12 @@
 # 安装与验证
 
-以下命令以 Windows PowerShell 和 `py -3.11` 为例。
+普通用户建议优先使用 `uvx`。以下命令以 Windows PowerShell 为例。
 
 ## 安装
 
-### 开发目录安装
+### 推荐：uvx
 
-```powershell
-git clone https://github.com/JcDizzy/CC-Web-MCP.git <安装目录>
-cd <安装目录>
-py -3.11 -m pip install -e .
-```
-
-如果 Windows 提示 `cc-web-mcp.exe` 安装到了不在 `PATH` 中的目录，例如 `E:\anaconda\Scripts`，安装本身仍然成功。后续命令可以直接使用模块形式：
-
-```powershell
-py -3.11 -m cc_web_mcp init
-py -3.11 -m cc_web_mcp doctor
-```
-
-### uvx 安装
-
-项目发布到 PyPI 后，推荐用 `uvx` 直接运行，不需要提前创建虚拟环境：
+项目发布在 PyPI 上，推荐用 `uvx` 直接运行，不需要克隆仓库，也不需要提前创建虚拟环境：
 
 ```powershell
 uvx cc-web-mcp init --runner uvx
@@ -31,9 +16,9 @@ uvx cc-web-mcp doctor
 `--runner uvx` 很重要：它会把 Claude Code MCP 注册成 `uvx cc-web-mcp`，避免把 uvx 临时缓存目录里的 `python.exe` 写进长期配置。
 如果之前已经用普通 `pip`、editable install 或旧的 uv 缓存路径初始化过，切换到 `uvx` 后请重新运行 `uvx cc-web-mcp init --runner uvx --force`，刷新 Claude Code 里保存的 MCP 命令路径。
 
-### pipx 或 pip 安装
+### 备选：pipx 或 pip
 
-如果想把命令长期安装到本机，也可以使用 `pipx`：
+如果所在环境不能使用 `uvx`，也可以使用 `pipx`：
 
 ```powershell
 pipx install cc-web-mcp
@@ -49,24 +34,32 @@ py -3.11 -m cc_web_mcp init
 py -3.11 -m cc_web_mcp doctor
 ```
 
-## 首次初始化
+如果 Windows 提示 `cc-web-mcp.exe` 安装到了不在 `PATH` 中的目录，例如 `E:\anaconda\Scripts`，安装本身仍然成功。后续命令可以直接使用 `py -3.11 -m cc_web_mcp ...` 模块形式。
 
-只需要运行一次：
+### 开发目录安装
+
+只有在需要修改源码或运行本地测试时，才建议使用 editable install：
 
 ```powershell
-cc-web-mcp init
+git clone https://github.com/JcDizzy/CC-Web-MCP.git <安装目录>
+cd <安装目录>
+py -3.11 -m pip install -e .
+py -3.11 -m cc_web_mcp init
+py -3.11 -m cc_web_mcp doctor
 ```
 
-如果通过 `uvx` 使用，推荐运行：
+## 首次初始化
+
+如果按推荐的 `uvx` 路径使用，首次初始化只需要运行一次：
 
 ```powershell
 uvx cc-web-mcp init --runner uvx
 ```
 
-如果 `cc-web-mcp` 命令不在 `PATH` 中，使用等价命令：
+非 `uvx` 安装时才使用本地命令：
 
 ```powershell
-py -3.11 -m cc_web_mcp init
+cc-web-mcp init
 ```
 
 这个命令会完成四件事：
@@ -79,13 +72,13 @@ py -3.11 -m cc_web_mcp init
 先预览、不改文件：
 
 ```powershell
-cc-web-mcp init --dry-run
+uvx cc-web-mcp init --runner uvx --dry-run
 ```
 
-预览 uvx 注册命令：
+非 `uvx` 安装时，也可以用本地命令预览：
 
 ```powershell
-uvx cc-web-mcp init --runner uvx --dry-run
+cc-web-mcp init --dry-run
 ```
 
 不注册 MCP，只写配置和 hook：
@@ -97,7 +90,7 @@ cc-web-mcp init --skip-mcp
 刷新已存在的 cc-web hook：
 
 ```powershell
-cc-web-mcp init --force
+uvx cc-web-mcp init --runner uvx --force
 ```
 
 ## 本地诊断
@@ -161,8 +154,8 @@ cc-web-mcp doctor
 `scripts/install_instructions.py`、`scripts/install_hook.py` 和 `scripts/doctor.py` 现在只是兼容包装。新安装和日常维护请使用：
 
 ```powershell
-cc-web-mcp init
-cc-web-mcp doctor
+uvx cc-web-mcp init --runner uvx
+uvx cc-web-mcp doctor
 ```
 
 ## 开发测试
