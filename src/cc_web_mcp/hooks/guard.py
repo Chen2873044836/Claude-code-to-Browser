@@ -183,11 +183,11 @@ def guard_pre_tool_use(payload: dict[str, Any], state_path: Path, config_path: P
     return deny(reason, additional_context)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--state", default=str(DEFAULT_STATE))
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     state_path = Path(args.state)
     config_path = Path(args.config)
 

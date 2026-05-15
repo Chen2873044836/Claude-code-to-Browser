@@ -171,7 +171,7 @@ def test_install_hook_replaces_existing_cc_web_hook_when_command_changes(tmp_pat
     assert "\\" not in command
 
 
-def test_install_hook_quotes_paths_for_bash_compatible_execution(tmp_path):
+def test_install_hook_quotes_paths_for_windows_execution(tmp_path):
     settings = tmp_path / "settings.json"
     settings.write_text("{}", encoding="utf-8")
 
@@ -186,7 +186,7 @@ def test_install_hook_quotes_paths_for_bash_compatible_execution(tmp_path):
     assert result.returncode == 0, result.stderr
     data = json.loads(settings.read_text(encoding="utf-8"))
     command = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    assert command.startswith("'E:/Program Files/Python311/python.exe' ")
+    assert command.startswith('"E:/Program Files/Python311/python.exe" ')
     assert "-m cc_web_mcp.hooks.guard" in command
     assert "\\" not in command
 

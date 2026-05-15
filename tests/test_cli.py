@@ -84,8 +84,8 @@ def test_cli_dispatches_config_init(tmp_path, monkeypatch):
 def test_cli_dispatches_hook_guard(monkeypatch):
     captured: list[bool] = []
 
-    def fake_main():
-        captured.append(True)
+    def fake_main(argv=None):
+        captured.extend(list(argv or []))
         return 0
 
     monkeypatch.setattr("cc_web_mcp.hooks.guard.main", fake_main)
@@ -93,4 +93,19 @@ def test_cli_dispatches_hook_guard(monkeypatch):
     result = cli.main(["hook-guard"])
 
     assert result == 0
-    assert captured == [True]
+    assert captured == []
+
+
+def test_cli_passes_hook_guard_arguments(monkeypatch):
+    captured: list[str] = []
+
+    def fake_main(argv=None):
+        captured.extend(list(argv or []))
+        return 0
+
+    monkeypatch.setattr("cc_web_mcp.hooks.guard.main", fake_main)
+
+    result = cli.main(["hook-guard", "--config", "config.json", "--state", "state.json"])
+
+    assert result == 0
+    assert captured == ["--config", "config.json", "--state", "state.json"]

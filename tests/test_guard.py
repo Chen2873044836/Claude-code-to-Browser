@@ -27,6 +27,23 @@ def run_guard(
     )
 
 
+def run_cli_guard(
+    state_path: Path,
+    payload: dict,
+    config_path: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    args = [sys.executable, "-m", "cc_web_mcp", "hook-guard", "--state", str(state_path)]
+    if config_path is not None:
+        args.extend(["--config", str(config_path)])
+    return subprocess.run(
+        args,
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def test_session_start_records_model(tmp_path):
     state = tmp_path / "state.json"
     result = run_guard(
@@ -39,6 +56,25 @@ def test_session_start_records_model(tmp_path):
     )
 
     assert result.returncode == 0
+    assert json.loads(state.read_text(encoding="utf-8"))["s1"]["model"] == "deepseek-v4-flash"
+
+
+def test_cli_hook_guard_accepts_state_and_config_arguments(tmp_path):
+    state = tmp_path / "state.json"
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"allowed_model_patterns": ["deepseek"]}), encoding="utf-8")
+
+    result = run_cli_guard(
+        state,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "s1",
+            "model": "deepseek-v4-flash",
+        },
+        config_path=config,
+    )
+
+    assert result.returncode == 0, result.stderr
     assert json.loads(state.read_text(encoding="utf-8"))["s1"]["model"] == "deepseek-v4-flash"
 
 

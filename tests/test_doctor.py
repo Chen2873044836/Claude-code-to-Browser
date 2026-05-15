@@ -9,6 +9,25 @@ def load_doctor_module():
     return module
 
 
+def command_path(path: str) -> str:
+    normalized = Path(path).as_posix()
+    if " " in normalized:
+        return f'"{normalized}"'
+    return normalized
+
+
+def python_guard_command() -> str:
+    return f"{command_path(sys.executable)} -m cc_web_mcp.hooks.guard"
+
+
+def python_cli_guard_command() -> str:
+    return f"{command_path(sys.executable)} -m cc_web_mcp hook-guard"
+
+
+def python_cli_guard_shell_command() -> str:
+    return f"{command_path(sys.executable)} -m cc_web_mcp hook-guard"
+
+
 def run_doctor(config_path: Path, claude_path: Path, settings_path: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
@@ -91,7 +110,7 @@ def test_doctor_passes_when_local_files_are_configured(tmp_path):
     claude_memory = tmp_path / "CLAUDE.md"
     claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
     settings = tmp_path / "settings.json"
-    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
+    hook_command = python_guard_command()
     settings.write_text(
         json.dumps(
             {
@@ -140,7 +159,7 @@ def test_build_report_checks_claude_mcp_registration(tmp_path, monkeypatch):
     claude_memory = tmp_path / "CLAUDE.md"
     claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
     settings = tmp_path / "settings.json"
-    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
+    hook_command = python_guard_command()
     settings.write_text(
         json.dumps(
             {
@@ -201,7 +220,7 @@ def test_mcp_registration_accepts_connected_status(monkeypatch):
         returncode = 0
         stdout = """cc-web:
   Scope: User config (available in all your projects)
-  Status: ✓ Connected
+  Status: \u2713 Connected
   Type: stdio
   Command: C:\\Python311\\python.exe
   Args: -m cc_web_mcp
@@ -214,7 +233,7 @@ def test_mcp_registration_accepts_connected_status(monkeypatch):
     check, recommendations = doctor._check_mcp_registration()
 
     assert check["ok"] is True
-    assert check["status"] == "✓ Connected"
+    assert check["status"] == "\u2713 Connected"
     assert recommendations == []
 
 
@@ -225,7 +244,7 @@ def test_doctor_json_output_is_ascii_safe_for_windows_console(tmp_path, monkeypa
     claude_memory = tmp_path / "CLAUDE.md"
     claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
     settings = tmp_path / "settings.json"
-    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
+    hook_command = python_guard_command()
     settings.write_text(
         json.dumps(
             {
@@ -245,7 +264,7 @@ def test_doctor_json_output_is_ascii_safe_for_windows_console(tmp_path, monkeypa
     monkeypatch.setattr(
         doctor,
         "_check_mcp_registration",
-        lambda: ({"ok": True, "stdout": "Status: ✓ Connected"}, []),
+        lambda: ({"ok": True, "stdout": "Status: \u2713 Connected"}, []),
     )
 
     exit_code = doctor.main(
@@ -283,7 +302,7 @@ def test_doctor_fails_when_guard_is_only_registered_for_session_start(tmp_path):
                             "hooks": [
                                 {
                                     "type": "command",
-                                    "command": "py -3.11 -m cc_web_mcp.hooks.guard",
+                                    "command": python_guard_command(),
                                 }
                             ],
                         }
@@ -309,7 +328,7 @@ def test_doctor_accepts_console_script_hook_guard(tmp_path):
     claude_memory = tmp_path / "CLAUDE.md"
     claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
     settings = tmp_path / "settings.json"
-    hook_command = "C:/Users/xhh/AppData/Local/Microsoft/WinGet/Links/uvx.exe cc-web-mcp==0.1.2 hook-guard"
+    hook_command = python_cli_guard_shell_command()
     settings.write_text(
         json.dumps(
             {
@@ -336,13 +355,86 @@ def test_doctor_accepts_console_script_hook_guard(tmp_path):
     assert report["checks"]["hook_guard"]["ok"] is True
 
 
+def test_doctor_accepts_exec_form_hook_guard(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
+    claude_memory = tmp_path / "CLAUDE.md"
+    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    settings = tmp_path / "settings.json"
+    hook = {
+        "type": "command",
+        "command": sys.executable,
+        "args": ["-m", "cc_web_mcp", "hook-guard"],
+    }
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [{"matcher": "", "hooks": [hook]}],
+                    "PreToolUse": [
+                        {
+                            "matcher": "^(mcp__cc[-_]web__.*|WebFetch)$",
+                            "hooks": [hook],
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_doctor(config, claude_memory, settings)
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report["checks"]["hook_guard"]["ok"] is True
+    assert report["checks"]["hook_guard"]["smoke_ok"] is True
+
+
+def test_doctor_fails_when_registered_guard_command_cannot_run(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
+    claude_memory = tmp_path / "CLAUDE.md"
+    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    settings = tmp_path / "settings.json"
+    hook_command = f"{python_cli_guard_shell_command()} --definitely-invalid"
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {"matcher": "", "hooks": [{"type": "command", "command": hook_command}]}
+                    ],
+                    "PreToolUse": [
+                        {
+                            "matcher": "^(mcp__cc[-_]web__.*|WebFetch)$",
+                            "hooks": [{"type": "command", "command": hook_command}],
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_doctor(config, claude_memory, settings)
+
+    assert result.returncode == 1, result.stderr
+    report = json.loads(result.stdout)
+    assert report["checks"]["hook_guard"]["ok"] is False
+    assert report["checks"]["hook_guard"]["session_start"] is True
+    assert report["checks"]["hook_guard"]["pre_tool_use"] is True
+    assert report["checks"]["hook_guard"]["smoke_ok"] is False
+    assert "--definitely-invalid" in report["checks"]["hook_guard"]["smoke_error"]
+
+
 def test_doctor_fails_when_pre_tool_matcher_does_not_cover_webfetch(tmp_path):
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
     claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
     settings = tmp_path / "settings.json"
-    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
+    hook_command = python_guard_command()
     settings.write_text(
         json.dumps(
             {
@@ -382,7 +474,7 @@ def test_build_report_runs_network_check_when_not_skipped(tmp_path, monkeypatch)
     claude_memory = tmp_path / "CLAUDE.md"
     claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
     settings = tmp_path / "settings.json"
-    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
+    hook_command = python_guard_command()
     settings.write_text(
         json.dumps(
             {
@@ -431,7 +523,7 @@ def test_build_report_passes_explicit_config_to_network_check(tmp_path, monkeypa
     claude_memory = tmp_path / "CLAUDE.md"
     claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
     settings = tmp_path / "settings.json"
-    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
+    hook_command = python_guard_command()
     settings.write_text(
         json.dumps(
             {

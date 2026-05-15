@@ -29,11 +29,9 @@ def _dispatch_serve(argv: list[str]) -> int:
 
 
 def _dispatch_hook_guard(argv: list[str]) -> int:
-    if argv:
-        raise SystemExit("hook-guard does not accept subcommand arguments")
     from cc_web_mcp.hooks import guard
 
-    return guard.main()
+    return guard.main(argv)
 
 
 def _dispatch_config(argv: list[str]) -> int:

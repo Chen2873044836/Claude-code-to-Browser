@@ -70,6 +70,7 @@ def test_init_uvx_runner_registers_persistent_uvx_command(tmp_path, monkeypatch)
         runner="uvx",
     )
 
+    package = f"cc-web-mcp=={install.__version__}"
     assert calls[0][1:] == [
         "mcp",
         "add",
@@ -80,11 +81,15 @@ def test_init_uvx_runner_registers_persistent_uvx_command(tmp_path, monkeypatch)
         "cc-web",
         "--",
         "uvx",
+        "--",
+        "--from",
+        package,
         "cc-web-mcp",
     ]
     settings = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-    hook_command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    assert hook_command == "uvx cc-web-mcp hook-guard"
+    hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]
+    assert hook["command"] == "uvx"
+    assert hook["args"] == ["--from", package, "cc-web-mcp", "hook-guard"]
     assert summary["runner"] == "uvx"
 
 
@@ -112,10 +117,11 @@ def test_init_uvx_runner_supports_custom_package_spec(tmp_path, monkeypatch):
         uvx_package="cc-web-mcp==0.1.0",
     )
 
-    assert calls[0][-2:] == ["uvx.exe", "cc-web-mcp==0.1.0"]
+    assert calls[0][-5:] == ["uvx.exe", "--", "--from", "cc-web-mcp==0.1.0", "cc-web-mcp"]
     settings = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-    hook_command = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-    assert hook_command == "uvx.exe cc-web-mcp==0.1.0 hook-guard"
+    hook = settings["hooks"]["SessionStart"][0]["hooks"][0]
+    assert hook["command"] == "uvx.exe"
+    assert hook["args"] == ["--from", "cc-web-mcp==0.1.0", "cc-web-mcp", "hook-guard"]
     assert summary["uvx_package"] == "cc-web-mcp==0.1.0"
 
 
@@ -143,11 +149,13 @@ def test_init_uvx_runner_with_pdf_registers_pdf_extra(tmp_path, monkeypatch):
         with_pdf=True,
     )
 
-    assert calls[0][-2:] == ["uvx", "cc-web-mcp[pdf]"]
+    package = f"cc-web-mcp[pdf]=={install.__version__}"
+    assert calls[0][-5:] == ["uvx", "--", "--from", package, "cc-web-mcp"]
     settings = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-    hook_command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    assert hook_command == "uvx 'cc-web-mcp[pdf]' hook-guard"
-    assert summary["uvx_package"] == "cc-web-mcp[pdf]"
+    hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]
+    assert hook["command"] == "uvx"
+    assert hook["args"] == ["--from", package, "cc-web-mcp", "hook-guard"]
+    assert summary["uvx_package"] == package
 
 
 def test_uvx_hook_command_normalizes_windows_launcher_path(monkeypatch):
@@ -156,7 +164,7 @@ def test_uvx_hook_command_normalizes_windows_launcher_path(monkeypatch):
 
     command = install.build_uvx_guard_command("cc-web-mcp")
 
-    assert command == "'C:/Program Files/uv/uvx.exe' cc-web-mcp hook-guard"
+    assert command == '"C:/Program Files/uv/uvx.exe" --from cc-web-mcp cc-web-mcp hook-guard'
 
 
 def test_init_uvx_runner_dry_run_shows_uvx_registration(tmp_path, monkeypatch):
@@ -170,7 +178,9 @@ def test_init_uvx_runner_dry_run_shows_uvx_registration(tmp_path, monkeypatch):
         dry_run=True,
     )
 
-    assert summary["mcp_registration_command"].endswith("cc-web -- uvx cc-web-mcp")
+    assert summary["mcp_registration_command"].endswith(
+        f"cc-web -- uvx -- --from cc-web-mcp=={install.__version__} cc-web-mcp"
+    )
     assert not (tmp_path / "settings.json").exists()
 
 
@@ -237,7 +247,7 @@ def test_force_register_claude_mcp_removes_existing_server_before_add(monkeypatc
     assert registered is True
     assert calls[0] == ["claude", "mcp", "remove", "cc-web", "--scope", "user"]
     assert calls[1] == command
-    assert command[-2:] == ["uvx", "cc-web-mcp==0.1.2"]
+    assert command[-5:] == ["uvx", "--", "--from", "cc-web-mcp==0.1.2", "cc-web-mcp"]
     assert stdout == "ok"
     assert stderr == ""
 
@@ -303,6 +313,7 @@ def test_install_hooks_use_module_command(tmp_path):
     assert changed is True
     assert "-m cc_web_mcp.hooks.guard" in command
     assert "hooks/guard.py" not in command.replace("\\", "/")
+    assert "shell" not in data["hooks"]["PreToolUse"][0]["hooks"][0]
 
 
 def test_merge_hook_replaces_existing_uvx_guard_entry():
@@ -326,18 +337,19 @@ def test_merge_hook_replaces_existing_uvx_guard_entry():
         data,
         "PreToolUse",
         "^(mcp__cc[-_]web__.*|WebFetch)$",
-        "uvx 'cc-web-mcp[pdf]' hook-guard",
+        "uvx --from 'cc-web-mcp[pdf]' cc-web-mcp hook-guard",
         force=True,
     )
 
     assert changed is True
     entries = data["hooks"]["PreToolUse"]
     assert len(entries) == 1
-    assert entries[0]["hooks"][0]["command"] == "uvx 'cc-web-mcp[pdf]' hook-guard"
+    assert entries[0]["hooks"][0]["command"] == "uvx --from 'cc-web-mcp[pdf]' cc-web-mcp hook-guard"
 
 
 def test_guard_command_recognizes_hook_guard_with_extra_arguments():
     assert install.is_cc_web_guard_command("uvx cc-web-mcp hook-guard --config C:/tmp/config.json")
+    assert install.is_cc_web_guard_command("uvx --from cc-web-mcp==0.1.4 cc-web-mcp hook-guard --config C:/tmp/config.json")
 
 
 def test_force_install_hooks_replaces_console_script_guard_commands(tmp_path, monkeypatch):
@@ -412,5 +424,7 @@ def test_force_install_hooks_replaces_console_script_guard_commands(tmp_path, mo
     assert changed is True
     assert len(session_entries) == 1
     assert len(pre_tool_entries) == 1
-    assert session_entries[0]["hooks"][0]["command"] == "uvx cc-web-mcp==0.1.2 hook-guard"
-    assert pre_tool_entries[0]["hooks"][0]["command"] == "uvx cc-web-mcp==0.1.2 hook-guard"
+    assert session_entries[0]["hooks"][0]["command"] == "uvx"
+    assert session_entries[0]["hooks"][0]["args"] == ["--from", "cc-web-mcp==0.1.2", "cc-web-mcp", "hook-guard"]
+    assert pre_tool_entries[0]["hooks"][0]["command"] == "uvx"
+    assert pre_tool_entries[0]["hooks"][0]["args"] == ["--from", "cc-web-mcp==0.1.2", "cc-web-mcp", "hook-guard"]

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import shlex
 import subprocess
@@ -11,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from cc_web_mcp import __version__
 from cc_web_mcp.config import ensure_user_config, resolve_config_path
 
 
@@ -64,6 +66,12 @@ def _quote_shell(value: str) -> str:
     normalized = _shell_path(value).strip()
     if not normalized:
         return '""'
+    if os.name == "nt":
+        if re.search(r'[\s\[\]()"&|<>^]', normalized):
+            return '"' + normalized.replace('"', r'\"') + '"'
+        return normalized
+    if _is_windows_executable_path(normalized):
+        return f'"{normalized}"'
     return shlex.quote(normalized)
 
 
@@ -90,13 +98,15 @@ def resolve_uvx_command() -> str:
 
 def build_uvx_tool_command(uvx_package: str = "cc-web-mcp") -> list[str]:
     package = (uvx_package or "").strip() or "cc-web-mcp"
-    return [resolve_uvx_command(), package]
+    return [resolve_uvx_command(), "--from", package, "cc-web-mcp"]
 
 
 def resolve_uvx_package(uvx_package: str = "cc-web-mcp", with_pdf: bool = False) -> str:
     package = (uvx_package or "").strip() or "cc-web-mcp"
     if with_pdf and package == "cc-web-mcp":
-        return "cc-web-mcp[pdf]"
+        return f"cc-web-mcp[pdf]=={__version__}"
+    if package == "cc-web-mcp":
+        return f"cc-web-mcp=={__version__}"
     return package
 
 
@@ -105,35 +115,59 @@ def build_guard_command(python_command: str | None = None) -> str:
     return f"{_format_python_command(python_command)} -m cc_web_mcp.hooks.guard"
 
 
+def build_uvx_guard_command_parts(uvx_package: str = "cc-web-mcp") -> list[str]:
+    return [*build_uvx_tool_command(uvx_package), "hook-guard"]
+
+
 def build_uvx_guard_command(uvx_package: str = "cc-web-mcp") -> str:
-    command = build_uvx_tool_command(uvx_package)
-    return " ".join([_format_python_command(command[0]), *(_quote_shell(part) for part in command[1:]), "hook-guard"])
+    command = build_uvx_guard_command_parts(uvx_package)
+    return " ".join([_format_python_command(command[0]), *(_quote_shell(part) for part in command[1:])])
 
 
-def build_hook_command(runner: str = "python", python_command: str | None = None, uvx_package: str = "cc-web-mcp") -> str:
+def build_hook_command(
+    runner: str = "python",
+    python_command: str | None = None,
+    uvx_package: str = "cc-web-mcp",
+) -> str | list[str]:
     if runner == "uvx":
-        return build_uvx_guard_command(uvx_package)
+        return build_uvx_guard_command_parts(uvx_package)
     if runner != "python":
         raise ValueError("runner must be 'python' or 'uvx'")
     return build_guard_command(python_command)
 
 
-def make_command_hook(command: str) -> dict[str, Any]:
-    return {
+def make_command_hook(command: str | list[str], runner: str = "python") -> dict[str, Any]:
+    hook = {
         "type": "command",
-        "command": command,
         "timeout": 5,
     }
+    if isinstance(command, list):
+        if not command:
+            raise ValueError("hook command must not be empty")
+        hook["command"] = command[0]
+        if len(command) > 1:
+            hook["args"] = command[1:]
+        return hook
+    hook["command"] = command
+    return hook
 
 
-def make_matcher(matcher: str, command: str) -> dict[str, Any]:
+def make_matcher(matcher: str, command: str | list[str], runner: str = "python") -> dict[str, Any]:
     return {
         "matcher": matcher,
-        "hooks": [make_command_hook(command)],
+        "hooks": [make_command_hook(command, runner=runner)],
     }
 
 
-def hook_matches(entry: Any, matcher: str, command: str) -> bool:
+def _hook_command_matches(hook: dict[str, Any], command: str | list[str]) -> bool:
+    if isinstance(command, list):
+        if not command:
+            return False
+        return hook.get("command") == command[0] and list(hook.get("args") or []) == command[1:]
+    return hook.get("command") == command and not hook.get("args")
+
+
+def hook_matches(entry: Any, matcher: str, command: str | list[str]) -> bool:
     if not isinstance(entry, dict):
         return False
     if entry.get("matcher", "") != matcher:
@@ -141,13 +175,14 @@ def hook_matches(entry: Any, matcher: str, command: str) -> bool:
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):
         return False
-    return any(isinstance(hook, dict) and hook.get("command") == command for hook in hooks)
+    return any(isinstance(hook, dict) and _hook_command_matches(hook, command) for hook in hooks)
 
 
-def is_cc_web_guard_command(command: Any) -> bool:
+def is_cc_web_guard_command(command: Any, args: Any | None = None) -> bool:
     if not isinstance(command, str):
         return False
-    normalized = command.replace("\\", "/").lower()
+    normalized_args = [str(arg).replace("\\", "/").lower() for arg in args] if isinstance(args, list) else []
+    normalized = " ".join([command.replace("\\", "/").lower(), *normalized_args]).strip()
     if (
         "cc_web_mcp.hooks.guard" in normalized
         or "cc-web-mcp.hooks.guard" in normalized
@@ -156,15 +191,23 @@ def is_cc_web_guard_command(command: Any) -> bool:
     ):
         return True
 
-    try:
-        tokens = shlex.split(normalized)
-    except ValueError:
-        tokens = normalized.split()
+    if normalized_args:
+        tokens = [command.replace("\\", "/").lower(), *normalized_args]
+    else:
+        try:
+            tokens = shlex.split(normalized)
+        except ValueError:
+            tokens = normalized.split()
     if not tokens or "hook-guard" not in tokens:
         return False
 
     hook_index = tokens.index("hook-guard")
-    return any(_is_cc_web_console_token(token) for token in tokens[:hook_index])
+    if any(_is_cc_web_console_token(token) for token in tokens[:hook_index]):
+        return True
+    return any(
+        token == "-m" and index + 1 < hook_index and tokens[index + 1] in {"cc_web_mcp", "cc-web-mcp"}
+        for index, token in enumerate(tokens[:hook_index])
+    )
 
 
 def _is_cc_web_console_token(token: str) -> bool:
@@ -186,10 +229,20 @@ def is_cc_web_guard_entry(entry: Any, matcher: str) -> bool:
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):
         return False
-    return any(isinstance(hook, dict) and is_cc_web_guard_command(hook.get("command")) for hook in hooks)
+    return any(
+        isinstance(hook, dict) and is_cc_web_guard_command(hook.get("command"), hook.get("args"))
+        for hook in hooks
+    )
 
 
-def merge_hook(data: dict[str, Any], event_name: str, matcher: str, command: str, force: bool = False) -> bool:
+def merge_hook(
+    data: dict[str, Any],
+    event_name: str,
+    matcher: str,
+    command: str | list[str],
+    force: bool = False,
+    runner: str = "python",
+) -> bool:
     hooks = data.setdefault("hooks", {})
     if not isinstance(hooks, dict):
         raise ValueError("settings.json field 'hooks' must be an object")
@@ -208,7 +261,7 @@ def merge_hook(data: dict[str, Any], event_name: str, matcher: str, command: str
     if not removed_existing and any(hook_matches(entry, matcher, command) for entry in entries):
         return False
 
-    entries.append(make_matcher(matcher, command))
+    entries.append(make_matcher(matcher, command, runner=runner))
     return True
 
 
@@ -222,8 +275,8 @@ def install_hooks(
     data = load_settings(settings_path)
     command = build_hook_command(runner=runner, python_command=python_command, uvx_package=uvx_package)
     changed = False
-    changed |= merge_hook(data, "SessionStart", "", command, force=force)
-    changed |= merge_hook(data, "PreToolUse", DEFAULT_MATCHER, command, force=force)
+    changed |= merge_hook(data, "SessionStart", "", command, force=force, runner=runner)
+    changed |= merge_hook(data, "PreToolUse", DEFAULT_MATCHER, command, force=force, runner=runner)
 
     backup_path = None
     if changed:
@@ -304,6 +357,8 @@ def build_claude_mcp_add_command(
     uvx_package: str = "cc-web-mcp",
 ) -> list[str]:
     command = list(server_command or build_server_command(runner=runner, uvx_package=uvx_package))
+    if runner == "uvx" and command:
+        command = [command[0], "--", *command[1:]]
     return [
         resolve_claude_command(),
         "mcp",

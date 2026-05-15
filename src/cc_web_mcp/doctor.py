@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -72,8 +73,8 @@ def _check_claude_instructions(path: Path) -> tuple[dict[str, Any], list[str]]:
     return {"ok": ok, "path": str(path)}, recommendations
 
 
-def _hook_command_mentions_guard(command: Any) -> bool:
-    return is_cc_web_guard_command(command)
+def _hook_command_mentions_guard(command: Any, args: Any | None = None) -> bool:
+    return is_cc_web_guard_command(command, args)
 
 
 def _iter_hook_entries(settings: dict[str, Any], event_name: str) -> list[dict[str, Any]]:
@@ -87,12 +88,29 @@ def _iter_hook_entries(settings: dict[str, Any], event_name: str) -> list[dict[s
 
 
 def _entry_has_guard_command(entry: dict[str, Any]) -> bool:
-    if _hook_command_mentions_guard(entry.get("command")):
+    if _hook_command_mentions_guard(entry.get("command"), entry.get("args")):
         return True
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):
         return False
-    return any(isinstance(hook, dict) and _hook_command_mentions_guard(hook.get("command")) for hook in hooks)
+    return any(
+        isinstance(hook, dict) and _hook_command_mentions_guard(hook.get("command"), hook.get("args"))
+        for hook in hooks
+    )
+
+
+def _iter_guard_hooks(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    direct = {"command": entry.get("command"), "args": entry.get("args")}
+    if _hook_command_mentions_guard(direct["command"], direct["args"]):
+        return [direct]
+    hooks = entry.get("hooks", [])
+    if not isinstance(hooks, list):
+        return []
+    return [
+        hook
+        for hook in hooks
+        if isinstance(hook, dict) and _hook_command_mentions_guard(hook.get("command"), hook.get("args"))
+    ]
 
 
 def _matcher_covers_samples(matcher: str | None, samples: tuple[str, ...]) -> tuple[bool, str]:
@@ -126,12 +144,95 @@ def _check_hook_event(settings: dict[str, Any], event_name: str, required_sample
     return False, reasons[0] if reasons else f"{event_name} matcher is incomplete"
 
 
-def _check_hook_guard(path: Path) -> tuple[dict[str, Any], list[str]]:
+def _first_guard_hook(settings: dict[str, Any], event_name: str) -> dict[str, Any] | None:
+    for entry in _iter_hook_entries(settings, event_name):
+        hooks = _iter_guard_hooks(entry)
+        if hooks:
+            return hooks[0]
+    return None
+
+
+def _hook_run_command(hook: dict[str, Any]) -> str | list[str] | None:
+    command = hook.get("command")
+    args = hook.get("args")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    if isinstance(args, list):
+        return [command, *(str(arg) for arg in args)]
+    return command
+
+
+def _run_hook_command(
+    hook: dict[str, Any],
+    payload: dict[str, Any],
+    state_path: Path,
+    config_path: Path,
+) -> tuple[bool, str, str]:
+    command = _hook_run_command(hook)
+    if command is None:
+        return False, "", "Hook command is missing."
+
+    if isinstance(command, list):
+        full_command: str | list[str] = [*command, "--state", str(state_path), "--config", str(config_path)]
+        display_command = " ".join(shlex.quote(str(part)) for part in full_command)
+    else:
+        full_command = f'{command} --state "{state_path}" --config "{config_path}"'
+        display_command = full_command
+
+    try:
+        result = subprocess.run(
+            full_command,
+            input=json.dumps(payload),
+            text=True,
+            capture_output=True,
+            check=False,
+            shell=isinstance(full_command, str),
+            timeout=10,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except Exception as exc:
+        return False, display_command, f"{type(exc).__name__}: {exc}"
+
+    output = "\n".join(part for part in (result.stdout.strip(), result.stderr.strip()) if part)
+    if result.returncode != 0:
+        return False, display_command, output or f"exit code {result.returncode}"
+    return True, display_command, output
+
+
+def _smoke_check_hook_guard(
+    settings: dict[str, Any],
+    settings_path: Path,
+    config_path: Path,
+) -> tuple[dict[str, Any], list[str]]:
+    recommendations: list[str] = []
+    hook = _first_guard_hook(settings, "SessionStart")
+    if hook is None:
+        return {"ok": None, "skipped": True, "reason": "SessionStart hook is missing"}, recommendations
+
+    state_path = settings_path.with_name(f"{settings_path.name}.cc-web-doctor-state.tmp")
+    payload = {
+        "hook_event_name": "SessionStart",
+        "session_id": "cc-web-doctor",
+        "model": "deepseek-doctor",
+    }
+    ok, command, error = _run_hook_command(hook, payload, state_path, config_path)
+    try:
+        if state_path.exists():
+            state_path.unlink()
+    except OSError:
+        pass
+    if not ok:
+        recommendations.append("Run `cc-web-mcp init --runner uvx --force` to refresh the executable hook guard command.")
+    return {"ok": ok, "command": command, "error": error}, recommendations
+
+
+def _check_hook_guard(path: Path, config_path: Path) -> tuple[dict[str, Any], list[str]]:
     recommendations: list[str] = []
     data, error = _read_json(path)
     if data is None:
         recommendations.append("Run `cc-web-mcp init` to add the cc-web hook guard.")
-        return {"ok": False, "path": str(path), "error": error}, recommendations
+        return {"ok": False, "path": str(path), "error": error, "smoke_ok": None}, recommendations
 
     session_ok, session_reason = _check_hook_event(data, "SessionStart")
     pre_tool_ok, pre_tool_reason = _check_hook_event(
@@ -143,7 +244,11 @@ def _check_hook_guard(path: Path) -> tuple[dict[str, Any], list[str]]:
             "WebFetch",
         ),
     )
-    ok = session_ok and pre_tool_ok
+    smoke_check: dict[str, Any] = {"ok": None, "skipped": True}
+    if session_ok:
+        smoke_check, smoke_recs = _smoke_check_hook_guard(data, path, config_path)
+        recommendations.extend(smoke_recs)
+    ok = session_ok and pre_tool_ok and smoke_check.get("ok") is not False
     if not ok:
         recommendations.append("Run `cc-web-mcp init --force` to refresh the cc-web hook guard.")
     return {
@@ -153,6 +258,9 @@ def _check_hook_guard(path: Path) -> tuple[dict[str, Any], list[str]]:
         "pre_tool_use": pre_tool_ok,
         "session_start_reason": session_reason,
         "pre_tool_use_reason": pre_tool_reason,
+        "smoke_ok": smoke_check.get("ok"),
+        "smoke_command": smoke_check.get("command", ""),
+        "smoke_error": smoke_check.get("error", ""),
     }, recommendations
 
 
@@ -226,7 +334,7 @@ def build_report(
     recommendations: list[str] = []
     config_check, config_recs = _check_config(config_path)
     instructions_check, instructions_recs = _check_claude_instructions(claude_memory_path)
-    hook_check, hook_recs = _check_hook_guard(settings_path)
+    hook_check, hook_recs = _check_hook_guard(settings_path, config_path)
     if skip_mcp_registration:
         mcp_check, mcp_recs = {"ok": None, "skipped": True}, []
     else:
