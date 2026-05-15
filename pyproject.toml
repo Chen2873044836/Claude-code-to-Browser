@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cc-web-mcp"
+version = "0.1.0"
+description = "Claude Code MCP web search and fetch tools for third-party models."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "mcp",
+  "httpx",
+  "beautifulsoup4",
+  "lxml",
+  "markdownify",
+]
+
+[project.scripts]
+cc-web-mcp = "cc_web_mcp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cc_web_mcp = ["data/*.json"]

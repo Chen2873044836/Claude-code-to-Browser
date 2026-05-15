@@ -1,85 +1,172 @@
 # 安装与验证
 
-以下命令以 Windows PowerShell 和 `py -3.11` 为例。`<安装目录>` 请替换为你自己的项目路径。
+以下命令以 Windows PowerShell 和 `py -3.11` 为例。
 
 ## 安装
 
-1. 克隆仓库：
+### 开发目录安装
 
 ```powershell
 git clone https://github.com/JcDizzy/CC-Web-MCP.git <安装目录>
 cd <安装目录>
+py -3.11 -m pip install -e .
 ```
 
-2. 安装依赖：
+如果 Windows 提示 `cc-web-mcp.exe` 安装到了不在 `PATH` 中的目录，例如 `E:\anaconda\Scripts`，安装本身仍然成功。后续命令可以直接使用模块形式：
 
 ```powershell
-py -3.11 -m pip install -r requirements.txt
+py -3.11 -m cc_web_mcp init
+py -3.11 -m cc_web_mcp doctor
 ```
 
-如果要运行测试，再安装开发依赖：
+### uvx 安装
+
+项目发布到 PyPI 后，推荐用 `uvx` 直接运行，不需要提前创建虚拟环境：
 
 ```powershell
-py -3.11 -m pip install -r requirements-dev.txt
+uvx cc-web-mcp init --runner uvx
+uvx cc-web-mcp doctor
 ```
 
-3. 注册到 Claude Code：
+`--runner uvx` 很重要：它会把 Claude Code MCP 注册成 `uvx cc-web-mcp`，避免把 uvx 临时缓存目录里的 `python.exe` 写进长期配置。
+
+### pipx 或 pip 安装
+
+如果想把命令长期安装到本机，也可以使用 `pipx`：
 
 ```powershell
-claude mcp add --scope user --transport stdio cc-web -- py -3.11 .\server.py
+pipx install cc-web-mcp
+cc-web-mcp init
+cc-web-mcp doctor
 ```
 
-如果要使用指定 Python，请把路径替换为你自己的解释器位置：
+也可以安装到当前 Python 环境：
 
 ```powershell
-claude mcp add --scope user --transport stdio cc-web -- <Python解释器路径> .\server.py
+py -3.11 -m pip install cc-web-mcp
+py -3.11 -m cc_web_mcp init
+py -3.11 -m cc_web_mcp doctor
 ```
 
-4. 确认 MCP 已注册：
+## 首次初始化
+
+只需要运行一次：
+
+```powershell
+cc-web-mcp init
+```
+
+如果通过 `uvx` 使用，推荐运行：
+
+```powershell
+uvx cc-web-mcp init --runner uvx
+```
+
+如果 `cc-web-mcp` 命令不在 `PATH` 中，使用等价命令：
+
+```powershell
+py -3.11 -m cc_web_mcp init
+```
+
+这个命令会完成四件事：
+
+- 创建用户配置文件。
+- 注册 Claude Code 用户级 stdio MCP。普通 Python 安装会注册为当前 Python 的 `-m cc_web_mcp`；`--runner uvx` 会注册为 `uvx cc-web-mcp`。
+- 写入用户级 `~\.claude\CLAUDE.md` 路由提示。
+- 合并更新用户级 `~\.claude\settings.json` hook 守卫，并在写入前备份。
+
+先预览、不改文件：
+
+```powershell
+cc-web-mcp init --dry-run
+```
+
+预览 uvx 注册命令：
+
+```powershell
+uvx cc-web-mcp init --runner uvx --dry-run
+```
+
+不注册 MCP，只写配置和 hook：
+
+```powershell
+cc-web-mcp init --skip-mcp
+```
+
+刷新已存在的 cc-web hook：
+
+```powershell
+cc-web-mcp init --force
+```
+
+## 本地诊断
+
+```powershell
+cc-web-mcp doctor
+```
+
+如果 `cc-web-mcp` 命令不在 `PATH` 中，使用：
+
+```powershell
+py -3.11 -m cc_web_mcp doctor
+```
+
+只看 JSON，且跳过真实网络访问：
+
+```powershell
+cc-web-mcp doctor --json --skip-network
+```
+
+确认 Claude Code MCP 注册：
 
 ```powershell
 claude mcp get cc-web
 ```
 
-5. 安装 Claude Code 启动指令：
+## 配置文件
+
+查看当前配置路径：
 
 ```powershell
-py -3.11 .\scripts\install_instructions.py
+cc-web-mcp config path
 ```
 
-这个脚本会把 cc-web 路由说明写入用户级 `~\.claude\CLAUDE.md`。它的作用是让 DeepSeek、Qwen、Kimi 等第三方模型在第一次思考时就避开原生 `WebSearch`，直接使用 cc-web。
-
-6. 安装 Claude Code hook 守卫：
+只初始化配置文件，不写 Claude Code：
 
 ```powershell
-py -3.11 .\scripts\install_hook.py
+cc-web-mcp config init
 ```
 
-这个脚本会合并更新用户级 `~\.claude\settings.json`，并在写入前创建 `settings.json.cc-web-backup.<时间戳>` 备份。它可以重复运行，不会重复添加同一条 hook。
-
-Claude Code 可能用 bash 执行 hook，即使你平时在 Windows PowerShell 里使用 Claude Code。安装脚本会把 hook command 里的 Windows 路径自动归一化为 bash 友好的正斜杠形式，并给含空格的路径加 shell 引号，避免出现 `E:anacondapython.exe: command not found` 这类错误。
-
-7. 在 Claude Code 中调用 `health_check`，确认依赖和网络连通性。
-
-## 本地诊断
-
-也可以在命令行先做一次本地诊断：
+显示当前配置内容：
 
 ```powershell
-py -3.11 .\scripts\doctor.py
+cc-web-mcp config show
 ```
 
-默认诊断会检查本地配置、Claude Code 指令、hook 守卫和网络连通性。如果只想看 JSON 结果，便于贴给模型分析，并且暂时跳过真实网络访问：
+默认配置路径：
+
+- Windows：`%APPDATA%\cc-web-mcp\config.json`
+- macOS/Linux：`~/.config/cc-web-mcp/config.json`
+
+也可以通过环境变量覆盖：
 
 ```powershell
-py -3.11 .\scripts\doctor.py --json --skip-network
+$env:CC_WEB_MCP_CONFIG="D:\path\to\config.json"
+cc-web-mcp doctor
 ```
 
-如需限制只有 DeepSeek 等第三方模型能调用本 MCP，请保留启动指令和 hook 守卫，并在 `config.json` 的 `allowed_model_patterns` 中维护允许模型。
+## 旧脚本兼容
 
-## 测试
+`scripts/install_instructions.py`、`scripts/install_hook.py` 和 `scripts/doctor.py` 现在只是兼容包装。新安装和日常维护请使用：
 
 ```powershell
-py -3.11 -m pip install -r requirements-dev.txt
+cc-web-mcp init
+cc-web-mcp doctor
+```
+
+## 开发测试
+
+```powershell
+py -3.11 -m pip install -e .
 py -3.11 -m pytest .\tests -q
 ```

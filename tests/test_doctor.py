@@ -1,20 +1,11 @@
 import json
-import importlib.util
 import subprocess
 import sys
 from pathlib import Path
 
-
-ROOT = Path(__file__).resolve().parents[1]
-DOCTOR = ROOT / "scripts" / "doctor.py"
-
-
 def load_doctor_module():
-    spec = importlib.util.spec_from_file_location("cc_web_doctor_under_test", DOCTOR)
-    assert spec is not None
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
+    import cc_web_mcp.doctor as module
+
     return module
 
 
@@ -22,7 +13,8 @@ def run_doctor(config_path: Path, claude_path: Path, settings_path: Path) -> sub
     return subprocess.run(
         [
             sys.executable,
-            str(DOCTOR),
+            "-m",
+            "cc_web_mcp.doctor",
             "--config",
             str(config_path),
             "--claude-memory",
@@ -31,6 +23,7 @@ def run_doctor(config_path: Path, claude_path: Path, settings_path: Path) -> sub
             str(settings_path),
             "--json",
             "--skip-network",
+            "--skip-mcp-registration",
         ],
         text=True,
         capture_output=True,
@@ -42,7 +35,8 @@ def run_doctor_text(config_path: Path, claude_path: Path, settings_path: Path) -
     return subprocess.run(
         [
             sys.executable,
-            str(DOCTOR),
+            "-m",
+            "cc_web_mcp.doctor",
             "--config",
             str(config_path),
             "--claude-memory",
@@ -50,6 +44,7 @@ def run_doctor_text(config_path: Path, claude_path: Path, settings_path: Path) -
             "--settings",
             str(settings_path),
             "--skip-network",
+            "--skip-mcp-registration",
         ],
         text=True,
         capture_output=True,
@@ -72,8 +67,7 @@ def test_doctor_reports_missing_claude_instructions_and_hook(tmp_path):
     assert report["checks"]["config"]["ok"] is True
     assert report["checks"]["claude_instructions"]["ok"] is False
     assert report["checks"]["hook_guard"]["ok"] is False
-    assert any("install_instructions.py" in item for item in report["recommendations"])
-    assert any("install_hook.py" in item for item in report["recommendations"])
+    assert any("cc-web-mcp init" in item for item in report["recommendations"])
 
 
 def test_doctor_text_output_keeps_english_prompts(tmp_path):
@@ -86,10 +80,9 @@ def test_doctor_text_output_keeps_english_prompts(tmp_path):
     result = run_doctor_text(config, claude_memory, settings)
 
     assert result.returncode == 1, result.stderr
-    assert "cc-web doctor: Needs attention" in result.stdout
+    assert "cc-web-mcp doctor: Needs attention" in result.stdout
     assert "Recommendations:" in result.stdout
-    assert "Run scripts/install_instructions.py" in result.stdout
-    assert "Run scripts/install_hook.py" in result.stdout
+    assert "Run `cc-web-mcp init`" in result.stdout
 
 
 def test_doctor_passes_when_local_files_are_configured(tmp_path):
@@ -98,7 +91,7 @@ def test_doctor_passes_when_local_files_are_configured(tmp_path):
     claude_memory = tmp_path / "CLAUDE.md"
     claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
     settings = tmp_path / "settings.json"
-    hook_command = "py -3.11 ./hooks/guard.py"
+    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
     settings.write_text(
         json.dumps(
             {
@@ -140,6 +133,140 @@ def test_doctor_passes_when_local_files_are_configured(tmp_path):
     assert report["checks"]["hook_guard"]["ok"] is True
 
 
+def test_build_report_checks_claude_mcp_registration(tmp_path, monkeypatch):
+    doctor = load_doctor_module()
+    config = tmp_path / "config.json"
+    config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
+    claude_memory = tmp_path / "CLAUDE.md"
+    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    settings = tmp_path / "settings.json"
+    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": hook_command}]}],
+                    "PreToolUse": [
+                        {
+                            "matcher": "^(mcp__cc[-_]web__.*|WebFetch)$",
+                            "hooks": [{"type": "command", "command": hook_command}],
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_check_mcp_registration",
+        lambda: ({"ok": False, "error": "No MCP server found with name: cc-web"}, ["Run `cc-web-mcp init` to register the cc-web MCP server."]),
+    )
+
+    report = doctor.build_report(config, claude_memory, settings, skip_network=True)
+
+    assert report["ok"] is False
+    assert report["checks"]["mcp_registration"]["ok"] is False
+    assert any("register the cc-web MCP server" in item for item in report["recommendations"])
+
+
+def test_mcp_registration_requires_connected_status(monkeypatch):
+    doctor = load_doctor_module()
+
+    class Result:
+        returncode = 0
+        stdout = """cc-web:
+  Scope: User config (available in all your projects)
+  Status: Failed to connect
+  Type: stdio
+  Command: C:\\Python311\\python.exe
+  Args: -m cc_web_mcp
+"""
+        stderr = ""
+
+    monkeypatch.setattr(doctor, "resolve_claude_command", lambda: "claude.cmd")
+    monkeypatch.setattr(doctor.subprocess, "run", lambda *args, **kwargs: Result())
+
+    check, recommendations = doctor._check_mcp_registration()
+
+    assert check["ok"] is False
+    assert check["status"] == "Failed to connect"
+    assert any("not connected" in item for item in recommendations)
+
+
+def test_mcp_registration_accepts_connected_status(monkeypatch):
+    doctor = load_doctor_module()
+
+    class Result:
+        returncode = 0
+        stdout = """cc-web:
+  Scope: User config (available in all your projects)
+  Status: ✓ Connected
+  Type: stdio
+  Command: C:\\Python311\\python.exe
+  Args: -m cc_web_mcp
+"""
+        stderr = ""
+
+    monkeypatch.setattr(doctor, "resolve_claude_command", lambda: "claude.cmd")
+    monkeypatch.setattr(doctor.subprocess, "run", lambda *args, **kwargs: Result())
+
+    check, recommendations = doctor._check_mcp_registration()
+
+    assert check["ok"] is True
+    assert check["status"] == "✓ Connected"
+    assert recommendations == []
+
+
+def test_doctor_json_output_is_ascii_safe_for_windows_console(tmp_path, monkeypatch, capsys):
+    doctor = load_doctor_module()
+    config = tmp_path / "config.json"
+    config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
+    claude_memory = tmp_path / "CLAUDE.md"
+    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    settings = tmp_path / "settings.json"
+    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": hook_command}]}],
+                    "PreToolUse": [
+                        {
+                            "matcher": "^(mcp__cc[-_]web__.*|WebFetch)$",
+                            "hooks": [{"type": "command", "command": hook_command}],
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_check_mcp_registration",
+        lambda: ({"ok": True, "stdout": "Status: ✓ Connected"}, []),
+    )
+
+    exit_code = doctor.main(
+        [
+            "--config",
+            str(config),
+            "--claude-memory",
+            str(claude_memory),
+            "--settings",
+            str(settings),
+            "--json",
+            "--skip-network",
+        ]
+    )
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    output.encode("ascii")
+    assert "\\u2713" in output
+
+
 def test_doctor_fails_when_guard_is_only_registered_for_session_start(tmp_path):
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
@@ -156,7 +283,7 @@ def test_doctor_fails_when_guard_is_only_registered_for_session_start(tmp_path):
                             "hooks": [
                                 {
                                     "type": "command",
-                                    "command": "py -3.11 ./hooks/guard.py",
+                                    "command": "py -3.11 -m cc_web_mcp.hooks.guard",
                                 }
                             ],
                         }
@@ -182,7 +309,7 @@ def test_doctor_fails_when_pre_tool_matcher_does_not_cover_webfetch(tmp_path):
     claude_memory = tmp_path / "CLAUDE.md"
     claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
     settings = tmp_path / "settings.json"
-    hook_command = "py -3.11 ./hooks/guard.py"
+    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
     settings.write_text(
         json.dumps(
             {
@@ -222,7 +349,7 @@ def test_build_report_runs_network_check_when_not_skipped(tmp_path, monkeypatch)
     claude_memory = tmp_path / "CLAUDE.md"
     claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
     settings = tmp_path / "settings.json"
-    hook_command = "py -3.11 ./hooks/guard.py"
+    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
     settings.write_text(
         json.dumps(
             {
@@ -243,8 +370,8 @@ def test_build_report_runs_network_check_when_not_skipped(tmp_path, monkeypatch)
     )
     calls = []
 
-    def fake_network_check():
-        calls.append(True)
+    def fake_network_check(config_path=None):
+        calls.append(config_path)
         return {
             "ok": True,
             "first_available_search_backend": "bing_cn",
@@ -255,6 +382,45 @@ def test_build_report_runs_network_check_when_not_skipped(tmp_path, monkeypatch)
 
     report = doctor.build_report(config, claude_memory, settings, skip_network=False)
 
-    assert calls == [True]
+    assert calls == [config]
     assert report["ok"] is True
     assert report["checks"]["network"]["first_available_search_backend"] == "bing_cn"
+
+
+def test_build_report_passes_explicit_config_to_network_check(tmp_path, monkeypatch):
+    doctor = load_doctor_module()
+    config = tmp_path / "custom-config.json"
+    config.write_text('{"search_providers": ["bing_cn"]}', encoding="utf-8")
+    claude_memory = tmp_path / "CLAUDE.md"
+    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    settings = tmp_path / "settings.json"
+    hook_command = "py -3.11 -m cc_web_mcp.hooks.guard"
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [{"matcher": "", "hooks": [{"type": "command", "command": hook_command}]}],
+                    "PreToolUse": [
+                        {
+                            "matcher": "^(mcp__cc[-_]web__.*|WebFetch)$",
+                            "hooks": [{"type": "command", "command": hook_command}],
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_network_check(config_path):
+        calls.append(config_path)
+        return {"ok": True, "first_available_search_backend": "bing_cn"}, []
+
+    monkeypatch.setattr(doctor, "_check_network", fake_network_check, raising=False)
+    monkeypatch.setattr(doctor, "_check_mcp_registration", lambda: ({"ok": True}, []))
+
+    report = doctor.build_report(config, claude_memory, settings, skip_network=False)
+
+    assert calls == [config]
+    assert report["ok"] is True

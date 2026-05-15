@@ -1,6 +1,23 @@
 # 配置说明
 
-编辑仓库根目录的 `config.json`。
+配置文件默认位于用户配置目录，不再依赖仓库根目录的 `config.json`。
+
+- Windows：`%APPDATA%\cc-web-mcp\config.json`
+- macOS/Linux：`~/.config/cc-web-mcp/config.json`
+
+查看当前路径：
+
+```powershell
+cc-web-mcp config path
+```
+
+首次创建配置：
+
+```powershell
+cc-web-mcp config init
+```
+
+也可以通过 `CC_WEB_MCP_CONFIG` 指向自定义配置文件。
 
 ```json
 {

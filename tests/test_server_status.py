@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-import server
+from cc_web_mcp import server
 
 
 class FakeContext:

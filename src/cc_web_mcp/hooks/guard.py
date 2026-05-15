@@ -8,9 +8,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from cc_web_mcp.config import resolve_config_path
+
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "config.json"
+DEFAULT_CONFIG = resolve_config_path()
 DEFAULT_STATE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "ClaudeCode" / "cc_web_model_state.json"
 MODEL_ENV_NAMES = (
     "ANTHROPIC_MODEL",

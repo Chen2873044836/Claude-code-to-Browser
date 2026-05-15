@@ -2,7 +2,9 @@
 
 ## 已完成
 
-- Hook 守卫：`hooks/guard.py` 已输出 Claude Code `PreToolUse` 的 `hookSpecificOutput.permissionDecision = deny` 结构，降低后续 Claude Code 版本更新导致 hook 行为变化的风险。
+- Hook 守卫：`cc-web-mcp hook-guard` 已输出 Claude Code `PreToolUse` 的 `hookSpecificOutput.permissionDecision = deny` 结构，降低后续 Claude Code 版本更新导致 hook 行为变化的风险。
+- 标准包入口：已提供 `pyproject.toml`、`src/cc_web_mcp` 包结构和 `cc-web-mcp` console script。
+- 首次初始化：`cc-web-mcp init` 已统一创建配置、注册 Claude Code MCP、写入路由提示和合并 hook；PyPI/uvx 场景可用 `uvx cc-web-mcp init --runner uvx` 注册持久 uvx 命令。
 - Claude 误选防护：默认阻止官方 Claude 使用 cc-web，避免它在已有原生 `WebSearch/WebFetch` 时误选本 MCP；可通过 `allow_fetch_url_for_claude` 单独放开 `fetch_url`。
 - 第三方模型误选防护：通过 `CLAUDE.md` 指令预防 DeepSeek、Qwen、Kimi 等匹配模型误走原生 `WebSearch`；通过 `block_native_web_for_allowed_models` 和 hook 兜底拦截本地可达的 `WebFetch`。
 - 内容类型分流：HTML、纯文本、Markdown、JSON 已分流处理；PDF 和未知二进制类型默认拒绝。
@@ -14,7 +16,7 @@
 - 模型友好的失败提示：失败返回包含 `retryable`、`do_not_retry_reason` 和 `recommended_next_action`，减少重复调用和无效重试。
 - 截断续读提示：`fetch_url` 截断时返回 `truncation.next_call`，方便模型按下一段继续读取。
 - 状态显示：MCP 工具执行中会发送 progress/log 状态，返回 JSON 也会包含 `status_summary` 和 `steps`。
-- 本地诊断脚本：`scripts/doctor.py` 可检查配置文件、Claude Code 指令、hook 守卫和搜索后端连通性是否就位。
+- 本地诊断：`cc-web-mcp doctor` 可检查配置文件、Claude Code 指令、hook 守卫和搜索后端连通性是否就位。
 - 技术资料源轻量加权：默认小幅优先 GitHub、官方文档、包管理站点、Read the Docs、Stack Overflow 等技术来源，但不完全覆盖搜索后端原始排序。
 - 缓存和重复抓取控制：默认开启公开 URL 抓取缓存，TTL 由 `cache_ttl_seconds` 控制，缓存 key 包含 schema version。
 - PDF 可选提取：安装 `requirements-optional.txt` 并开启 `enable_pdf_extract` 后，可用 `pypdf` 提取公开 PDF 文本。

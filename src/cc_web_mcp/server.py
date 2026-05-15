@@ -3,7 +3,7 @@ import logging
 from mcp import types
 from mcp.server.fastmcp import Context, FastMCP
 
-from web import check_health, fetch_page, research_brief as build_research_brief, search_web, to_json_text
+from cc_web_mcp.web import check_health, fetch_page, research_brief as build_research_brief, search_web, to_json_text
 
 
 logging.getLogger("mcp").setLevel(logging.WARNING)
@@ -119,5 +119,9 @@ async def health_check() -> str:
     return to_json_text(await check_health())
 
 
-if __name__ == "__main__":
+def run_stdio() -> None:
     mcp.run("stdio")
+
+
+if __name__ == "__main__":
+    run_stdio()

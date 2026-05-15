@@ -17,6 +17,8 @@ import httpx
 from bs4 import BeautifulSoup
 from markdownify import markdownify as html_to_markdown
 
+from cc_web_mcp.config import resolve_config_path
+
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -25,7 +27,7 @@ USER_AGENT = (
 )
 MAX_DOWNLOAD_BYTES = 5_000_000
 REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.json")
+DEFAULT_CONFIG_PATH = resolve_config_path()
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "cc-web-mcp"
 CACHE_SCHEMA_VERSION = 3
 BING_CN_SCOPE_NOTE = "bing_cn may be region-biased and is used as fallback; it is not equivalent to full global search."
@@ -1293,8 +1295,8 @@ async def research_brief(
     }
 
 
-async def check_health() -> dict[str, Any]:
-    config = load_config()
+async def check_health(config_path: str | Path | None = None) -> dict[str, Any]:
+    config = load_config(config_path)
     search_providers = _normalize_search_providers(
         _cfg(config, "search_providers", None),
         _cfg(config, "search_provider", "duckduckgo"),

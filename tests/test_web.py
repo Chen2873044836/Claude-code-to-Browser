@@ -4,8 +4,8 @@ from pathlib import Path
 import httpx
 import pytest
 
-import web
-from web import FetchSafetyError, extract_markdown, normalize_search_results, validate_fetch_url
+from cc_web_mcp import web
+from cc_web_mcp.web import FetchSafetyError, extract_markdown, normalize_search_results, validate_fetch_url
 
 
 @pytest.fixture

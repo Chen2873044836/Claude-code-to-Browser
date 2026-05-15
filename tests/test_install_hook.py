@@ -46,7 +46,7 @@ def test_install_hook_creates_hooks_and_preserves_existing_settings(tmp_path):
     pre_tool = data["hooks"]["PreToolUse"][0]
     assert pre_tool["matcher"] == r"^(mcp__cc[-_]web__.*|WebFetch)$"
     assert pre_tool["hooks"][0]["type"] == "command"
-    assert "hooks/guard.py" in pre_tool["hooks"][0]["command"].replace("\\", "/")
+    assert "-m cc_web_mcp.hooks.guard" in pre_tool["hooks"][0]["command"]
 
 
 def test_install_hook_is_idempotent(tmp_path):
@@ -118,7 +118,7 @@ def test_install_hook_preserves_unrelated_guard_with_same_matcher(tmp_path):
         for hook in entry.get("hooks", [])
     ]
     assert "py -3.11 D:/other_project/hooks/guard.py" in commands
-    assert any("cc_web_mcp/hooks/guard.py" in command.replace("\\", "/") for command in commands)
+    assert any("-m cc_web_mcp.hooks.guard" in command for command in commands)
 
 
 def test_install_hook_replaces_existing_cc_web_hook_when_command_changes(tmp_path):
@@ -167,21 +167,19 @@ def test_install_hook_replaces_existing_cc_web_hook_when_command_changes(tmp_pat
     assert data["hooks"]["PreToolUse"][0]["matcher"] == r"^(mcp__cc[-_]web__.*|WebFetch)$"
     command = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
     assert command.startswith("E:/anaconda/python.exe ")
+    assert "-m cc_web_mcp.hooks.guard" in command
     assert "\\" not in command
 
 
 def test_install_hook_quotes_paths_for_bash_compatible_execution(tmp_path):
     settings = tmp_path / "settings.json"
     settings.write_text("{}", encoding="utf-8")
-    guard = tmp_path / "Project Dir" / "hooks" / "guard.py"
 
     result = run_install(
         settings,
         [
             "--python-command",
             r"E:\Program Files\Python311\python.exe",
-            "--guard",
-            str(guard),
         ],
     )
 
@@ -189,7 +187,7 @@ def test_install_hook_quotes_paths_for_bash_compatible_execution(tmp_path):
     data = json.loads(settings.read_text(encoding="utf-8"))
     command = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
     assert command.startswith("'E:/Program Files/Python311/python.exe' ")
-    assert sh_single_quote(guard.resolve().as_posix()) in command
+    assert "-m cc_web_mcp.hooks.guard" in command
     assert "\\" not in command
 
 

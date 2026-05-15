@@ -6,7 +6,6 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-GUARD = ROOT / "hooks" / "guard.py"
 
 
 def run_guard(
@@ -15,7 +14,7 @@ def run_guard(
     env: dict | None = None,
     config_path: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    args = [sys.executable, str(GUARD), "--state", str(state_path)]
+    args = [sys.executable, "-m", "cc_web_mcp.hooks.guard", "--state", str(state_path)]
     if config_path is not None:
         args.extend(["--config", str(config_path)])
     return subprocess.run(
