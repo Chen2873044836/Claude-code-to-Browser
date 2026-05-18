@@ -22,7 +22,7 @@ cc-web-mcp config init
 ```json
 {
   "allowed_model_patterns": ["deepseek"],
-  "search_providers": ["duckduckgo", "bing_cn"],
+  "search_providers": ["duckduckgo", "bing", "bing_cn"],
   "allow_fetch_url_for_claude": false,
   "block_native_web_for_allowed_models": true,
   "searxng_base_url": "",
@@ -38,7 +38,8 @@ cc-web-mcp config init
   "jina_min_chars": 300,
   "allow_private_networks": false,
   "cache_ttl_seconds": 1800,
-  "search_cache_ttl_seconds": 60,
+  "search_cache_ttl_seconds": 300,
+  "search_backend_cooldown_seconds": 60,
   "trusted_proxy_domains": [],
   "enable_pdf_extract": false
 }
@@ -77,7 +78,7 @@ cc-web-mcp config init
 默认搜索链路：
 
 ```json
-"search_providers": ["duckduckgo", "bing_cn"]
+"search_providers": ["duckduckgo", "bing", "bing_cn"]
 ```
 
 如果当前网络无法访问 DuckDuckGo，可以保留默认降级链路，也可以直接只使用 Bing 中文入口：
@@ -91,7 +92,7 @@ cc-web-mcp config init
 如果你希望增加一个不依赖账号的英文公开搜索 fallback，可以把 Mojeek 放到链路后面：
 
 ```json
-"search_providers": ["duckduckgo", "mojeek", "bing_cn"]
+"search_providers": ["duckduckgo", "bing", "mojeek", "bing_cn"]
 ```
 
 `mojeek` 使用公开 HTML 搜索入口，适合作为轻量补充，不等价于付费搜索 API。
@@ -100,7 +101,7 @@ cc-web-mcp config init
 
 ```json
 {
-  "search_providers": ["searxng", "duckduckgo", "bing_cn"],
+  "search_providers": ["searxng", "duckduckgo", "bing", "bing_cn"],
   "searxng_base_url": "https://your-searxng.example"
 }
 ```
@@ -135,7 +136,8 @@ cc-web-mcp config init
 
 `cache_ttl_seconds` 控制公开 URL 正文抓取缓存时间。正文抓取缓存只在 `allow_private_networks: false` 时启用，缓存 key 包含 schema version，避免旧格式缓存污染新逻辑。
 
-`search_cache_ttl_seconds` 控制成功搜索结果的短缓存时间，默认 `60` 秒。它只缓存成功结果，不缓存失败或限流响应；它独立于 `allow_private_networks`，因为搜索缓存不抓取用户提供的任意 URL。
+`search_cache_ttl_seconds` 控制成功搜索结果的短缓存时间，默认 `300` 秒。它只缓存成功结果，不缓存失败或限流响应；它独立于 `allow_private_networks`，因为搜索缓存不抓取用户提供的任意 URL。
+`search_backend_cooldown_seconds` 控制搜索后端在触发 403/429、反爬挑战或网络失败后的基础冷却时间，默认 `60` 秒；连续失败会指数退避，最高 300 秒。冷却期间会跳过该后端，优先尝试链路里的下一个后端。
 
 `allow_private_networks` 默认是 `false`。只建议在可信内网文档场景临时开启：
 

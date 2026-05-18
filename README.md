@@ -91,8 +91,8 @@ cc-web-mcp config path
 常用调整：
 
 - 同时适配更多第三方模型：`"allowed_model_patterns": ["deepseek", "qwen", "kimi"]`
-- DuckDuckGo 不稳定时只使用 Bing 中文入口：`"search_providers": ["bing_cn"]`
-- 增加 Mojeek 作为轻量 fallback：`"search_providers": ["duckduckgo", "mojeek", "bing_cn"]`
+- DuckDuckGo 不稳定时只使用国际版 Bing：`"search_providers": ["bing"]`
+- 增加 Mojeek 作为轻量 fallback：`"search_providers": ["duckduckgo", "bing", "mojeek", "bing_cn"]`
 - 某个第三方 API 的原生 Web 工具已经可用时：`"block_native_web_for_allowed_models": false`
 - 明确允许官方 Claude 调用 `cc-web fetch_url`：`"allow_fetch_url_for_claude": true`
 

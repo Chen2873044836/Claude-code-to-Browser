@@ -4,6 +4,7 @@
   ],
   "search_providers": [
     "duckduckgo",
+    "bing",
     "bing_cn"
   ],
   "allow_fetch_url_for_claude": false,
@@ -21,7 +22,8 @@
   "jina_min_chars": 300,
   "allow_private_networks": false,
   "cache_ttl_seconds": 1800,
-  "search_cache_ttl_seconds": 60,
+  "search_cache_ttl_seconds": 300,
+  "search_backend_cooldown_seconds": 60,
   "trusted_proxy_domains": [],
   "enable_pdf_extract": false
 }

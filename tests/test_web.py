@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import httpx
@@ -12,6 +13,13 @@ from cc_web_mcp.web import FetchSafetyError, extract_markdown, normalize_search_
 @pytest.fixture
 def public_dns(monkeypatch):
     monkeypatch.setattr(web.socket, "getaddrinfo", lambda *args, **kwargs: [(None, None, None, None, ("93.184.216.34", 443))])
+
+
+@pytest.fixture(autouse=True)
+def clear_search_backend_cooldowns():
+    web._SEARCH_BACKEND_COOLDOWNS.clear()
+    yield
+    web._SEARCH_BACKEND_COOLDOWNS.clear()
 
 
 def test_normalize_search_results_from_duckduckgo_html():
@@ -121,6 +129,14 @@ def test_normalize_searxng_html_results():
     assert results == [
         {"title": "Example Doc", "url": "https://example.com/doc", "snippet": "Readable snippet."}
     ]
+
+
+def test_default_headers_do_not_expose_tool_specific_user_agent():
+    ua = web._headers()["User-Agent"]
+
+    assert "GlobalWebMCP" not in ua
+    assert "cc-web" not in ua.lower()
+    assert "Mozilla/5.0" in ua
 
 
 def test_normalize_mojeek_results():
@@ -426,6 +442,105 @@ def test_search_web_falls_back_to_bing_cn_when_duckduckgo_fails(monkeypatch):
     assert result["results"][0]["url"] == "https://github.com/modelcontextprotocol/servers"
 
 
+def test_search_web_uses_international_bing_provider(monkeypatch):
+    class Config:
+        search_provider = "bing"
+        search_providers = ("bing",)
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            assert url == "https://www.bing.com/search"
+            assert params["q"] == "mcp docs"
+            assert params["mkt"] == "zh-CN"
+            assert params["setlang"] == "zh-cn"
+            assert "cc" not in params
+            assert "ensearch" not in params
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <li class="b_algo">
+                    <h2><a href="https://example.com/international">International Bing</a></h2>
+                    <div class="b_caption"><p>International result.</p></div>
+                  </li>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=2, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "bing"
+    assert "search_scope_note" not in result
+    assert result["attempted_backends"] == [{"backend": "bing", "ok": True}]
+    assert result["results"][0]["url"] == "https://example.com/international"
+
+
+def test_search_web_default_chain_prefers_international_bing_before_bing_cn(monkeypatch):
+    class Config:
+        search_provider = "duckduckgo"
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            calls.append(url)
+            if "duckduckgo.com" in url:
+                raise httpx.ConnectError("blocked", request=httpx.Request("GET", url))
+            if "www.bing.com" in url:
+                return httpx.Response(
+                    200,
+                    text="""
+                    <html><body>
+                      <li class="b_algo">
+                        <h2><a href="https://example.com/bing">Bing</a></h2>
+                        <p>better fallback</p>
+                      </li>
+                    </body></html>
+                    """,
+                    request=httpx.Request("GET", url),
+                )
+            raise AssertionError("bing_cn should not be reached when international bing succeeds")
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=2, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "bing"
+    assert calls == ["https://html.duckduckgo.com/html/", "https://www.bing.com/search"]
+
+
 def test_search_web_falls_back_when_provider_returns_empty_results(monkeypatch):
     class Config:
         search_provider = "duckduckgo"
@@ -683,6 +798,71 @@ def test_search_web_cache_is_independent_from_private_network_fetch_setting(monk
     assert second["results"][0]["url"] == "https://example.com/1"
 
 
+def test_search_web_skips_backend_during_cooldown(monkeypatch):
+    class Config:
+        search_provider = "duckduckgo"
+        search_providers = ("duckduckgo", "bing")
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 120
+
+    web._SEARCH_BACKEND_COOLDOWNS.clear()
+    calls = []
+    now = time.time()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            calls.append(url)
+            if "duckduckgo.com" in url:
+                return httpx.Response(
+                    202,
+                    text="<form id='challenge-form' action='/anomaly.js'></form>",
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <li class="b_algo">
+                    <h2><a href="https://example.com/bing">Bing</a></h2>
+                    <p>fallback result</p>
+                  </li>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(web.time, "time", lambda: now)
+
+    first = asyncio.run(web.search_web("cooldown", max_results=2, config=Config()))
+    second = asyncio.run(web.search_web("cooldown again", max_results=2, config=Config()))
+
+    assert first["backend"] == "bing"
+    assert second["backend"] == "bing"
+    assert calls == [
+        "https://html.duckduckgo.com/html/",
+        "https://www.bing.com/search",
+        "https://www.bing.com/search",
+    ]
+    assert second["attempted_backends"][0]["backend"] == "duckduckgo_html"
+    assert second["attempted_backends"][0]["skipped"] is True
+    assert second["attempted_backends"][0]["retry_after_seconds"] == 120
+
+    web._SEARCH_BACKEND_COOLDOWNS.clear()
+
+
 def test_search_web_records_status_steps_and_callback(monkeypatch):
     class Config:
         search_provider = "duckduckgo"
@@ -785,6 +965,16 @@ def test_load_config_keeps_ordered_search_providers(tmp_path):
     assert config.search_providers == ("duckduckgo", "bing_cn")
 
 
+def test_load_config_defaults_to_international_bing_before_bing_cn(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+
+    config = web.load_config(config_path)
+
+    assert config.search_providers == ("duckduckgo", "bing", "bing_cn")
+    assert config.search_cache_ttl_seconds == 300
+
+
 def test_search_providers_prefer_explicit_chain_over_legacy_provider(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -845,6 +1035,46 @@ def test_check_health_reports_configured_search_provider_chain(monkeypatch, tmp_
     assert health["search_backend_status"]["duckduckgo"]["ok"] is False
     assert health["search_backend_status"]["bing_cn"] == {"ok": True, "status": 200}
     assert health["first_available_search_backend"] == "bing_cn"
+
+
+def test_check_health_reports_international_bing_provider(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        """
+        {
+          "search_providers": ["bing"]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    class FakeResponse:
+        def __init__(self, status_code):
+            self.status_code = status_code
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            assert url == "https://www.bing.com/search"
+            assert params == {"q": "cc-web health", "mkt": "zh-CN", "setlang": "zh-cn"}
+            return FakeResponse(200)
+
+    monkeypatch.setattr(web, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    health = asyncio.run(web.check_health())
+
+    assert health["search_providers"] == ["bing"]
+    assert health["search_backend_status"]["bing"] == {"ok": True, "status": 200}
+    assert health["first_available_search_backend"] == "bing"
 
 
 def test_check_health_marks_rate_limited_search_backend_unavailable(monkeypatch, tmp_path):

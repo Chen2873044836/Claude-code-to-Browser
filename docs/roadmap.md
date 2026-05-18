@@ -28,7 +28,7 @@
 
 ```json
 {
-  "search_providers": ["duckduckgo", "bing_cn"],
+  "search_providers": ["duckduckgo", "bing", "bing_cn"],
   "searxng_base_url": "",
   "tavily_api_key_env": "TAVILY_API_KEY",
   "brave_api_key_env": "BRAVE_API_KEY"

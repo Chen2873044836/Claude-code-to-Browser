@@ -9,6 +9,7 @@ import ipaddress
 import json
 import re
 import socket
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ from cc_web_mcp.config import resolve_config_path
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0 Safari/537.36 GlobalWebMCP/1.1"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 MAX_DOWNLOAD_BYTES = 5_000_000
 REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
@@ -37,6 +38,9 @@ SEARCH_CACHE_SCHEMA_VERSION = 2
 BROWSE_REF_TTL_SECONDS = 1_800
 MAX_BROWSE_REFS = 200
 BING_CN_SCOPE_NOTE = "bing_cn may be region-biased and is used as fallback; it is not equivalent to full global search."
+DEFAULT_SEARCH_PROVIDERS = ("duckduckgo", "bing", "bing_cn")
+MAX_SEARCH_BACKEND_COOLDOWN_SECONDS = 300
+_SEARCH_BACKEND_COOLDOWNS: dict[str, dict[str, Any]] = {}
 ANTI_BOT_DOMAINS = (
     "zhihu.com",
     "weixin.qq.com",
@@ -250,7 +254,7 @@ _BROWSE_SESSION = BrowseSession()
 class GlobalWebConfig:
     allowed_model_patterns: tuple[str, ...] = ("deepseek",)
     search_provider: str = "duckduckgo"
-    search_providers: tuple[str, ...] = ("duckduckgo", "bing_cn")
+    search_providers: tuple[str, ...] = DEFAULT_SEARCH_PROVIDERS
     allow_fetch_url_for_claude: bool = False
     block_native_web_for_allowed_models: bool = True
     searxng_base_url: str = ""
@@ -264,7 +268,8 @@ class GlobalWebConfig:
     jina_min_chars: int = 300
     allow_private_networks: bool = False
     cache_ttl_seconds: int = 1_800
-    search_cache_ttl_seconds: int = 60
+    search_cache_ttl_seconds: int = 300
+    search_backend_cooldown_seconds: int = 60
     cache_dir: str = str(DEFAULT_CACHE_DIR)
     trusted_proxy_domains: tuple[str, ...] = ()
     brief_concurrency: int = 3
@@ -289,7 +294,6 @@ def _normalize_search_provider_name(provider: Any) -> str:
     aliases = {
         "ddg": "duckduckgo",
         "duckduckgo_html": "duckduckgo",
-        "bing": "bing_cn",
         "bingcn": "bing_cn",
         "bing_china": "bing_cn",
         "mojeek_html": "mojeek",
@@ -304,14 +308,14 @@ def _normalize_search_providers(raw_providers: Any, default_provider: str = "duc
         items = list(raw_providers)
     else:
         default = _normalize_search_provider_name(default_provider)
-        items = ["duckduckgo", "bing_cn"] if default == "duckduckgo" else [default]
+        items = list(DEFAULT_SEARCH_PROVIDERS) if default == "duckduckgo" else [default]
 
     providers: list[str] = []
     for item in items:
         provider = _normalize_search_provider_name(item)
         if provider and provider not in providers:
             providers.append(provider)
-    return tuple(providers or ("duckduckgo", "bing_cn"))
+    return tuple(providers or DEFAULT_SEARCH_PROVIDERS)
 
 
 def _normalize_string_tuple(raw_items: Any) -> tuple[str, ...]:
@@ -417,7 +421,8 @@ def load_config(path: str | Path | None = None) -> GlobalWebConfig:
         jina_min_chars=_bounded_int(raw.get("jina_min_chars"), 300, 0, 5_000),
         allow_private_networks=bool(raw.get("allow_private_networks", False)),
         cache_ttl_seconds=_bounded_int(raw.get("cache_ttl_seconds"), 1_800, 0, 86_400),
-        search_cache_ttl_seconds=_bounded_int(raw.get("search_cache_ttl_seconds"), 60, 0, 3_600),
+        search_cache_ttl_seconds=_bounded_int(raw.get("search_cache_ttl_seconds"), 300, 0, 3_600),
+        search_backend_cooldown_seconds=_bounded_int(raw.get("search_backend_cooldown_seconds"), 60, 0, 3_600),
         cache_dir=str(raw.get("cache_dir") or DEFAULT_CACHE_DIR),
         trusted_proxy_domains=_normalize_string_tuple(raw.get("trusted_proxy_domains")),
         brief_concurrency=_bounded_int(raw.get("brief_concurrency"), 3, 1, 5),
@@ -445,6 +450,7 @@ def config_to_dict(config: GlobalWebConfig) -> dict[str, Any]:
         "allow_private_networks": config.allow_private_networks,
         "cache_ttl_seconds": config.cache_ttl_seconds,
         "search_cache_ttl_seconds": config.search_cache_ttl_seconds,
+        "search_backend_cooldown_seconds": config.search_backend_cooldown_seconds,
         "cache_dir": config.cache_dir,
         "trusted_proxy_domains": list(config.trusted_proxy_domains),
         "brief_concurrency": config.brief_concurrency,
@@ -940,6 +946,10 @@ def normalize_bing_cn_results(html: str, max_results: int = 5) -> list[dict[str,
     return [result.__dict__ for result in results]
 
 
+def normalize_bing_results(html: str, max_results: int = 5) -> list[dict[str, str]]:
+    return normalize_bing_cn_results(html, max_results=max_results)
+
+
 def _technical_source_score(url: str) -> int:
     host = (urlparse(url).hostname or "").lower()
     path = urlparse(url).path.lower()
@@ -992,6 +1002,62 @@ def _provider_backend_name(provider: str) -> str:
     return normalized
 
 
+def _search_backend_cooldown_status(backend: str) -> dict[str, Any] | None:
+    entry = _SEARCH_BACKEND_COOLDOWNS.get(backend)
+    if not entry:
+        return None
+    retry_after = int(max(0, float(entry.get("until", 0)) - time.time()) + 0.999)
+    if retry_after <= 0:
+        _SEARCH_BACKEND_COOLDOWNS.pop(backend, None)
+        return None
+    return {
+        "reason": str(entry.get("reason") or "previous backend failure"),
+        "retry_after_seconds": retry_after,
+        "failures": int(entry.get("failures") or 1),
+    }
+
+
+def _should_cooldown_search_error(exc: Exception) -> bool:
+    if isinstance(exc, EmptySearchResultsError):
+        return False
+    if isinstance(exc, SearchBackendUnavailableError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code if exc.response is not None else 0
+        return status in {403, 429} or 500 <= status <= 599
+    return isinstance(exc, (httpx.ConnectError, httpx.TimeoutException))
+
+
+def _record_search_backend_failure(backend: str, exc: Exception, config: GlobalWebConfig | Any) -> int | None:
+    if not _should_cooldown_search_error(exc):
+        return None
+    base_seconds = _bounded_int(_cfg(config, "search_backend_cooldown_seconds", 60), 60, 0, 3_600)
+    if base_seconds <= 0:
+        return None
+    previous = _SEARCH_BACKEND_COOLDOWNS.get(backend) or {}
+    failures = int(previous.get("failures") or 0) + 1
+    cooldown_seconds = min(base_seconds * (2 ** max(0, failures - 1)), MAX_SEARCH_BACKEND_COOLDOWN_SECONDS)
+    _SEARCH_BACKEND_COOLDOWNS[backend] = {
+        "until": time.time() + cooldown_seconds,
+        "reason": f"{type(exc).__name__}: {exc}",
+        "failures": failures,
+    }
+    return cooldown_seconds
+
+
+def _clear_search_backend_cooldown(backend: str) -> None:
+    _SEARCH_BACKEND_COOLDOWNS.pop(backend, None)
+
+
+def _search_backend_cooldown_report() -> dict[str, dict[str, Any]]:
+    report: dict[str, dict[str, Any]] = {}
+    for backend in list(_SEARCH_BACKEND_COOLDOWNS):
+        status = _search_backend_cooldown_status(backend)
+        if status:
+            report[backend] = status
+    return report
+
+
 def _search_backend_health_request(provider: str, config: GlobalWebConfig | Any) -> tuple[str, str, dict[str, str]]:
     """Return backend name, URL, and query params for a lightweight search probe."""
     provider = _normalize_search_provider_name(provider)
@@ -1000,6 +1066,8 @@ def _search_backend_health_request(provider: str, config: GlobalWebConfig | Any)
         if not base_url:
             raise ValueError("searxng_base_url 不能为空")
         return provider, f"{base_url}/search", {"q": "cc-web health", "format": "json"}
+    if provider == "bing":
+        return provider, "https://www.bing.com/search", {"q": "cc-web health", "mkt": "zh-CN", "setlang": "zh-cn"}
     if provider == "bing_cn":
         return provider, "https://cn.bing.com/search", {"q": "cc-web health", "ensearch": "1", "cc": "cn", "setlang": "zh-cn"}
     if provider == "duckduckgo":
@@ -1046,6 +1114,20 @@ async def _search_with_provider(
             if not results and json_error:
                 raise json_error
             return "searxng_html", results
+
+    if provider == "bing":
+        async with httpx.AsyncClient(
+            headers={**_headers(), "Accept-Language": language or "zh-cn"},
+            timeout=REQUEST_TIMEOUT,
+            max_redirects=5,
+        ) as client:
+            response = await client.get(
+                "https://www.bing.com/search",
+                params={"q": query, "mkt": "zh-CN", "setlang": language or "zh-cn"},
+                follow_redirects=True,
+            )
+            response.raise_for_status()
+            return "bing", normalize_bing_results(response.text, max_results=max_results)
 
     if provider == "bing_cn":
         async with httpx.AsyncClient(
@@ -1635,9 +1717,25 @@ async def search_web(
 
     for provider_index, provider in enumerate(providers):
         backend = _provider_backend_name(provider)
+        cooldown = _search_backend_cooldown_status(backend)
+        if cooldown and provider_index < len(providers) - 1:
+            attempted_backends.append(
+                {
+                    "backend": backend,
+                    "ok": False,
+                    "skipped": True,
+                    "error": f"cooldown: {cooldown['reason']}",
+                    "retry_after_seconds": cooldown["retry_after_seconds"],
+                }
+            )
+            await status.add(f"cc-web: skipping {backend}, cooldown {cooldown['retry_after_seconds']}s remaining")
+            if not fallback_reason:
+                fallback_reason = f"{backend} skipped: cooldown {cooldown['retry_after_seconds']}s remaining"
+            continue
         try:
             await status.add(f"cc-web: searching {backend} for {query}")
             backend, results = await _search_with_provider(provider, provider_query, provider_result_limit, region, language, config)
+            _clear_search_backend_cooldown(backend)
             raw_result_count = len(results[:provider_result_limit])
 
             if _cfg(config, "prefer_technical_sources", True):
@@ -1679,7 +1777,11 @@ async def search_web(
             return _attach_search_ref_ids(response)
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
-            attempted_backends.append({"backend": backend, "ok": False, "error": last_error})
+            attempted = {"backend": backend, "ok": False, "error": last_error}
+            cooldown_seconds = _record_search_backend_failure(backend, exc, config)
+            if cooldown_seconds:
+                attempted["cooldown_seconds"] = cooldown_seconds
+            attempted_backends.append(attempted)
             await status.add(f"cc-web: {backend} failed, trying next backend")
             if not fallback_reason:
                 fallback_reason = f"{backend} failed: {last_error}"
@@ -2053,6 +2155,9 @@ async def check_health(config_path: str | Path | None = None) -> dict[str, Any]:
         },
         "network": {},
     }
+    cooldown_report = _search_backend_cooldown_report()
+    if cooldown_report:
+        checks["search_backend_cooldowns"] = cooldown_report
     async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT) as client:
         for provider in search_providers:
             try:
@@ -2078,6 +2183,7 @@ async def check_health(config_path: str | Path | None = None) -> dict[str, Any]:
         for name, url in {
             "duckduckgo": "https://duckduckgo.com/",
             "bing_cn": "https://cn.bing.com/",
+            "bing": "https://www.bing.com/",
             "github": "https://github.com/",
             "anthropic": "https://www.anthropic.com/",
             "jina_reader": "https://r.jina.ai/https://example.com/",

@@ -51,7 +51,7 @@ def _check_config(path: Path) -> tuple[dict[str, Any], list[str]]:
     if not isinstance(providers, list):
         providers = [str(providers)]
     if not providers:
-        recommendations.append("Set search_providers, for example ['duckduckgo', 'bing_cn'].")
+        recommendations.append("Set search_providers, for example ['duckduckgo', 'bing', 'bing_cn'].")
     return {
         "ok": True,
         "path": str(path),
