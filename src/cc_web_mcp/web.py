@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import inspect
 import ipaddress
 import json
 import re
 import socket
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +33,9 @@ REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
 DEFAULT_CONFIG_PATH = resolve_config_path()
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "cc-web-mcp"
 CACHE_SCHEMA_VERSION = 3
-SEARCH_CACHE_SCHEMA_VERSION = 1
+SEARCH_CACHE_SCHEMA_VERSION = 2
+BROWSE_REF_TTL_SECONDS = 1_800
+MAX_BROWSE_REFS = 200
 BING_CN_SCOPE_NOTE = "bing_cn may be region-biased and is used as fallback; it is not equivalent to full global search."
 ANTI_BOT_DOMAINS = (
     "zhihu.com",
@@ -114,6 +119,14 @@ class FetchDiagnosticError(FetchSafetyError):
         self.diagnostics = diagnostics
 
 
+class EmptySearchResultsError(RuntimeError):
+    pass
+
+
+class SearchBackendUnavailableError(RuntimeError):
+    pass
+
+
 StatusCallback = Callable[[str], Awaitable[None] | None]
 
 
@@ -141,6 +154,7 @@ class StatusRecorder:
 
 
 async def _call_with_optional_status(fn: Callable[..., Any], *args: Any, status_callback: StatusCallback | None = None, **kwargs: Any) -> Any:
+    signature = None
     if status_callback is not None:
         try:
             signature = inspect.signature(fn)
@@ -148,6 +162,14 @@ async def _call_with_optional_status(fn: Callable[..., Any], *args: Any, status_
                 kwargs["status_callback"] = status_callback
         except (TypeError, ValueError):
             kwargs["status_callback"] = status_callback
+    if kwargs:
+        try:
+            signature = signature or inspect.signature(fn)
+            accepts_var_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+            if not accepts_var_kwargs:
+                kwargs = {key: value for key, value in kwargs.items() if key in signature.parameters}
+        except (TypeError, ValueError):
+            pass
     return await fn(*args, **kwargs)
 
 
@@ -166,6 +188,62 @@ class FetchTarget:
     hostname: str
     host_header: str
     request_target: str
+
+
+@dataclass(frozen=True)
+class BrowseRef:
+    ref_id: str
+    kind: str
+    url: str
+    title: str = ""
+    snippet: str = ""
+    created_at: float = 0.0
+
+
+class BrowseSession:
+    def __init__(self, ttl_seconds: int = BROWSE_REF_TTL_SECONDS, max_entries: int = MAX_BROWSE_REFS):
+        self.ttl_seconds = max(1, int(ttl_seconds or BROWSE_REF_TTL_SECONDS))
+        self.max_entries = max(1, int(max_entries or MAX_BROWSE_REFS))
+        self._counter = 0
+        self._entries: OrderedDict[str, BrowseRef] = OrderedDict()
+
+    def _now(self) -> float:
+        return datetime.now(timezone.utc).timestamp()
+
+    def _prune(self) -> None:
+        now = self._now()
+        for ref_id, entry in list(self._entries.items()):
+            if now - entry.created_at > self.ttl_seconds:
+                self._entries.pop(ref_id, None)
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+
+    def add(self, kind: str, url: str, title: str = "", snippet: str = "") -> str:
+        self._prune()
+        self._counter += 1
+        ref_id = f"ccweb-{kind}-{self._counter}"
+        self._entries[ref_id] = BrowseRef(
+            ref_id=ref_id,
+            kind=kind,
+            url=url,
+            title=_clean_text(title),
+            snippet=_clean_text(snippet),
+            created_at=self._now(),
+        )
+        self._prune()
+        return ref_id
+
+    def get(self, ref_id: str | None) -> BrowseRef | None:
+        if not ref_id:
+            return None
+        self._prune()
+        entry = self._entries.get(str(ref_id).strip())
+        if entry:
+            self._entries.move_to_end(entry.ref_id)
+        return entry
+
+
+_BROWSE_SESSION = BrowseSession()
 
 
 @dataclass(frozen=True)
@@ -250,6 +328,60 @@ def _normalize_string_tuple(raw_items: Any) -> tuple[str, ...]:
         if value and value not in normalized:
             normalized.append(value)
     return tuple(normalized)
+
+
+def _normalize_domains(raw_domains: Any) -> tuple[str, ...]:
+    if isinstance(raw_domains, str):
+        items = [raw_domains]
+    elif isinstance(raw_domains, (list, tuple)):
+        items = list(raw_domains)
+    else:
+        items = []
+
+    domains: list[str] = []
+    for item in items:
+        raw = str(item or "").strip().lower()
+        if not raw:
+            continue
+        parsed = urlparse(raw if "://" in raw else f"//{raw}")
+        domain = (parsed.hostname or raw.split("/", 1)[0]).strip().strip(".")
+        if domain.startswith("*."):
+            domain = domain[2:]
+        if domain and domain not in domains:
+            domains.append(domain)
+    return tuple(domains)
+
+
+def _domains_query_suffix(domains: tuple[str, ...]) -> str:
+    if not domains:
+        return ""
+    terms = " OR ".join(f"site:{domain}" for domain in domains)
+    return f" ({terms})"
+
+
+def _query_with_domain_hints(query: str, domains: tuple[str, ...]) -> str:
+    if not domains:
+        return query
+    return f"{query}{_domains_query_suffix(domains)}"
+
+
+def filter_search_results_by_domains(
+    results: list[dict[str, str]],
+    domains: tuple[str, ...] | list[str] | str | None,
+) -> tuple[list[dict[str, str]], int]:
+    normalized_domains = _normalize_domains(domains)
+    if not normalized_domains:
+        return list(results), 0
+
+    filtered: list[dict[str, str]] = []
+    removed = 0
+    for result in results:
+        hostname = (urlparse(str(result.get("url") or "")).hostname or "").lower().strip(".")
+        if hostname and _domain_matches(hostname, normalized_domains):
+            filtered.append(result)
+        else:
+            removed += 1
+    return filtered, removed
 
 
 def load_config(path: str | Path | None = None) -> GlobalWebConfig:
@@ -361,6 +493,22 @@ def _resolved_private_hosts(host: str) -> list[str]:
     return private_ips
 
 
+def _resolved_policy_hosts(hostname: str, port: int) -> tuple[list[str], str]:
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return [], f"{type(exc).__name__}: {exc}"
+    hosts: list[str] = []
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        host = str(sockaddr[0])
+        if host not in hosts:
+            hosts.append(host)
+    return hosts, ""
+
+
 def _is_trusted_proxy_ip(ip: str) -> bool:
     try:
         parsed = ipaddress.ip_address(ip)
@@ -382,28 +530,108 @@ def _can_allow_trusted_proxy_resolution(
     return _domain_matches(hostname, trusted_domains) and all(_is_trusted_proxy_ip(ip) for ip in private_ips)
 
 
+def evaluate_network_policy(
+    url: str,
+    allow_private_networks: bool = False,
+    resolve_dns: bool = True,
+    trusted_proxy_domains: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, Any]:
+    cleaned = (url or "").strip()
+    parsed = urlparse(cleaned)
+    trusted_domains = _normalize_string_tuple(trusted_proxy_domains)
+    decision: dict[str, Any] = {
+        "allowed": False,
+        "url": cleaned,
+        "scheme": parsed.scheme,
+        "hostname": parsed.hostname or "",
+        "allow_private_networks": bool(allow_private_networks),
+        "resolve_dns": bool(resolve_dns),
+        "resolved_ips": [],
+        "blocked_ips": [],
+        "trusted_proxy": False,
+        "trusted_proxy_domains": list(trusted_domains),
+        "reason": "",
+    }
+
+    if parsed.scheme not in {"http", "https"}:
+        decision["reason"] = "unsupported_scheme"
+        return decision
+    if not parsed.netloc:
+        decision["reason"] = "missing_host"
+        return decision
+
+    hostname = parsed.hostname or ""
+    if not allow_private_networks and _is_private_host(hostname):
+        decision["reason"] = "restricted_host"
+        decision["blocked_ips"] = [hostname]
+        return decision
+
+    if resolve_dns:
+        port = parsed.port or _default_port(parsed.scheme)
+        resolved_ips, dns_error = _resolved_policy_hosts(hostname, port)
+        decision["resolved_ips"] = resolved_ips
+        if dns_error:
+            decision["dns_error"] = dns_error
+        blocked_ips = [ip for ip in resolved_ips if _is_private_host(ip)]
+        decision["blocked_ips"] = blocked_ips
+        if blocked_ips and not allow_private_networks:
+            if _can_allow_trusted_proxy_resolution(hostname, blocked_ips, trusted_domains):
+                decision["allowed"] = True
+                decision["trusted_proxy"] = True
+                decision["reason"] = "trusted_proxy"
+                return decision
+            decision["reason"] = "restricted_dns"
+            return decision
+
+    decision["allowed"] = True
+    decision["reason"] = "allowed"
+    return decision
+
+
+async def evaluate_network_policy_async(
+    url: str,
+    allow_private_networks: bool = False,
+    resolve_dns: bool = True,
+    trusted_proxy_domains: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, Any]:
+    return await asyncio.to_thread(
+        evaluate_network_policy,
+        url,
+        allow_private_networks=allow_private_networks,
+        resolve_dns=resolve_dns,
+        trusted_proxy_domains=trusted_proxy_domains,
+    )
+
+
+def _network_policy_error_message(decision: dict[str, Any]) -> str:
+    reason = decision.get("reason")
+    if reason == "unsupported_scheme":
+        return "仅允许抓取 http/https URL"
+    if reason == "missing_host":
+        return "URL 缺少主机名"
+    if reason == "restricted_host":
+        return "默认禁止抓取本机、内网、链路本地或云 metadata 地址"
+    if reason == "restricted_dns":
+        blocked_ips = ", ".join(decision.get("blocked_ips") or [])
+        return f"域名解析到受限地址，已阻止抓取: {blocked_ips}"
+    return "URL 被网络策略阻止"
+
+
 def validate_fetch_url(
     url: str,
     allow_private_networks: bool = False,
     resolve_dns: bool = True,
     trusted_proxy_domains: tuple[str, ...] | list[str] | None = None,
 ) -> str:
-    cleaned = (url or "").strip()
-    parsed = urlparse(cleaned)
-    if parsed.scheme not in {"http", "https"}:
-        raise FetchSafetyError("仅允许抓取 http/https URL")
-    if not parsed.netloc:
-        raise FetchSafetyError("URL 缺少主机名")
-    hostname = parsed.hostname or ""
-    if not allow_private_networks and _is_private_host(hostname):
-        raise FetchSafetyError("默认禁止抓取本机、内网、链路本地或云 metadata 地址")
-    if not allow_private_networks and resolve_dns:
-        private_ips = _resolved_private_hosts(hostname)
-        if private_ips:
-            if _can_allow_trusted_proxy_resolution(hostname, private_ips, trusted_proxy_domains):
-                return cleaned
-            raise FetchSafetyError(f"域名解析到受限地址，已阻止抓取: {', '.join(private_ips)}")
-    return cleaned
+    decision = evaluate_network_policy(
+        url,
+        allow_private_networks=allow_private_networks,
+        resolve_dns=resolve_dns,
+        trusted_proxy_domains=trusted_proxy_domains,
+    )
+    if not decision["allowed"]:
+        raise FetchSafetyError(_network_policy_error_message(decision))
+    return str(decision["url"])
 
 
 async def validate_fetch_url_async(
@@ -418,10 +646,10 @@ async def validate_fetch_url_async(
         resolve_dns=False,
         trusted_proxy_domains=trusted_proxy_domains,
     )
-    if not allow_private_networks and resolve_dns:
+    if resolve_dns:
         hostname = urlparse(cleaned).hostname or ""
         private_ips = await asyncio.to_thread(_resolved_private_hosts, hostname)
-        if private_ips:
+        if private_ips and not allow_private_networks:
             if _can_allow_trusted_proxy_resolution(hostname, private_ips, trusted_proxy_domains):
                 return cleaned
             raise FetchSafetyError(f"域名解析到受限地址，已阻止抓取: {', '.join(private_ips)}")
@@ -533,6 +761,35 @@ def _duckduckgo_result_url(raw_url: str) -> str:
     return raw_url
 
 
+def _bing_result_url(raw_url: str) -> str:
+    parsed = urlparse(raw_url)
+    hostname = (parsed.hostname or "").lower()
+    if not (hostname == "bing.com" or hostname.endswith(".bing.com")):
+        return raw_url
+    if not parsed.path.startswith("/ck/"):
+        return raw_url
+
+    query = parse_qs(parsed.query)
+    raw_target = (query.get("u") or [""])[0]
+    if not raw_target:
+        return raw_url
+
+    target = unquote(raw_target).strip()
+    if target.startswith(("http://", "https://")):
+        return target
+
+    encoded = target[2:] if target.startswith("a1") else target
+    padding = "=" * (-len(encoded) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode(f"{encoded}{padding}").decode("utf-8").strip()
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return raw_url
+    decoded = unquote(decoded)
+    if decoded.startswith(("http://", "https://")):
+        return decoded
+    return raw_url
+
+
 def _clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
@@ -574,6 +831,24 @@ def normalize_search_results(html: str, max_results: int = 5) -> list[dict[str, 
             break
 
     return [result.__dict__ for result in results]
+
+
+def _duckduckgo_challenge_reason(status_code: int, html: str) -> str:
+    text = (html or "").lower()
+    signals: list[str] = []
+    if status_code == 202:
+        signals.append("status=202")
+    for marker in (
+        "anomaly-modal",
+        "unfortunately, bots use duckduckgo too",
+        "challenge-form",
+        "anomaly.js",
+    ):
+        if marker in text:
+            signals.append(marker)
+    if signals:
+        return "duckduckgo_challenge: " + ", ".join(signals)
+    return ""
 
 
 def normalize_searxng_results(payload: dict[str, Any], max_results: int = 5) -> list[dict[str, str]]:
@@ -649,7 +924,7 @@ def normalize_bing_cn_results(html: str, max_results: int = 5) -> list[dict[str,
         if not anchor:
             continue
         title = _clean_text(anchor.get_text(" "))
-        url = str(anchor.get("href") or "").strip()
+        url = _bing_result_url(str(anchor.get("href") or "").strip())
         if not title or not url:
             continue
 
@@ -797,6 +1072,9 @@ async def _search_with_provider(
                 params={"q": query, "kl": region or "wt-wt"},
                 follow_redirects=True,
             )
+            challenge_reason = _duckduckgo_challenge_reason(response.status_code, response.text)
+            if challenge_reason:
+                raise SearchBackendUnavailableError(challenge_reason)
             response.raise_for_status()
             return "duckduckgo_html", normalize_search_results(response.text, max_results=max_results)
 
@@ -1038,6 +1316,7 @@ async def _limited_get(
         allow_private_networks=allow_private_networks,
         trusted_proxy_domains=trusted_proxy_domains,
     )
+    redirect_count = 0
     for _ in range(6):
         target = build_fetch_target(
             current_url,
@@ -1062,6 +1341,7 @@ async def _limited_get(
                     allow_private_networks=allow_private_networks,
                     trusted_proxy_domains=trusted_proxy_domains,
                 )
+                redirect_count += 1
                 continue
 
             chunks: list[bytes] = []
@@ -1076,7 +1356,7 @@ async def _limited_get(
                 headers=response.headers,
                 content=b"".join(chunks),
                 request=httpx.Request("GET", target.url, headers=response.request.headers),
-                extensions=response.extensions,
+                extensions={**response.extensions, "cc_web_redirect_count": redirect_count},
             )
             full_response.raise_for_status()
             return full_response
@@ -1158,6 +1438,7 @@ def _search_cache_key(
     region: str,
     language: str,
     providers: tuple[str, ...],
+    domains: tuple[str, ...] = (),
     schema_version: int = SEARCH_CACHE_SCHEMA_VERSION,
 ) -> str:
     raw = json.dumps(
@@ -1168,6 +1449,7 @@ def _search_cache_key(
             "region": region,
             "language": language,
             "providers": list(providers),
+            "domains": list(domains),
         },
         sort_keys=True,
     )
@@ -1236,11 +1518,72 @@ def _write_search_cache(config: GlobalWebConfig | Any, key: str, data: dict[str,
         return
 
 
+def _strip_result_ref_ids(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{key: value for key, value in result.items() if key != "ref_id"} for result in results]
+
+
+def _attach_search_ref_ids(response: dict[str, Any]) -> dict[str, Any]:
+    copied = {**response}
+    results: list[dict[str, Any]] = []
+    for result in response.get("results", []):
+        clean_result = {key: value for key, value in dict(result).items() if key != "ref_id"}
+        url = str(clean_result.get("url") or "")
+        if url:
+            clean_result["ref_id"] = _BROWSE_SESSION.add(
+                "search",
+                url,
+                title=str(clean_result.get("title") or ""),
+                snippet=str(clean_result.get("snippet") or ""),
+            )
+        results.append(clean_result)
+    copied["results"] = results
+    return copied
+
+
+def _ref_not_found_response(ref_id: str, status: StatusRecorder) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "ref_id": ref_id,
+        "error": f"ref_id not found or expired: {ref_id}",
+        "error_type": "ref_not_found",
+        "status_summary": "fetch failed: ref_id not found",
+        "steps": status.steps,
+        "retryable": False,
+        "do_not_retry_reason": "The ref_id is missing or expired; do not retry the same ref_id.",
+        "recommended_next_action": "Run web_search again or pass a direct URL.",
+    }
+
+
+def _looks_like_ref_id(value: str | None) -> bool:
+    return bool(str(value or "").strip().startswith("ccweb-"))
+
+
+async def _resolve_fetch_input(
+    url: str | None,
+    ref_id: str | None,
+    status: StatusRecorder,
+) -> tuple[str, str]:
+    candidate_ref_id = str(ref_id or "").strip()
+    raw_url = str(url or "").strip()
+    if not candidate_ref_id and _looks_like_ref_id(raw_url):
+        candidate_ref_id = raw_url
+    if not candidate_ref_id:
+        return raw_url, ""
+
+    entry = _BROWSE_SESSION.get(candidate_ref_id)
+    if not entry:
+        await status.add("cc-web: ref_id not found")
+        raise KeyError(candidate_ref_id)
+    await status.add(f"cc-web: resolved {candidate_ref_id} to {entry.url}")
+    return entry.url, candidate_ref_id
+
+
 async def search_web(
     query: str,
     max_results: int = 5,
     region: str = "wt-wt",
     language: str = "zh-cn",
+    domains: tuple[str, ...] | list[str] | str | None = None,
     config: GlobalWebConfig | None = None,
     status_callback: StatusCallback | None = None,
 ) -> dict[str, Any]:
@@ -1266,40 +1609,66 @@ async def search_web(
         _cfg(config, "search_providers", None),
         _cfg(config, "search_provider", "duckduckgo"),
     )
-    search_cache_key = _search_cache_key(query, max_results, region or "wt-wt", language or "zh-cn", providers)
+    normalized_domains = _normalize_domains(domains)
+    provider_query = _query_with_domain_hints(query, normalized_domains)
+    provider_result_limit = min(_cfg(config, "max_search_results", 10), max_results * 3 if normalized_domains else max_results)
+    search_cache_key = _search_cache_key(
+        query,
+        max_results,
+        region or "wt-wt",
+        language or "zh-cn",
+        providers,
+        normalized_domains,
+    )
     cached = _read_search_cache(config, search_cache_key)
     if cached:
         await status.add(f"cc-web: search cache hit for {query}")
         cached_response = {key: value for key, value in cached.items() if key != "cached_at"}
         cached_response["cache"] = "hit"
         cached_response["steps"] = status.steps
-        return cached_response
+        cached_response["results"] = _strip_result_ref_ids(cached_response.get("results", []))
+        return _attach_search_ref_ids(cached_response)
 
     attempted_backends: list[dict[str, Any]] = []
     fallback_reason = ""
     last_error = ""
 
-    for provider in providers:
+    for provider_index, provider in enumerate(providers):
         backend = _provider_backend_name(provider)
         try:
             await status.add(f"cc-web: searching {backend} for {query}")
-            backend, results = await _search_with_provider(provider, query, max_results, region, language, config)
-            attempted_backends.append({"backend": backend, "ok": True})
-            await status.add(f"cc-web: {backend} returned {len(results[:max_results])} results")
+            backend, results = await _search_with_provider(provider, provider_query, provider_result_limit, region, language, config)
+            raw_result_count = len(results[:provider_result_limit])
 
             if _cfg(config, "prefer_technical_sources", True):
                 results = rank_search_results(results)
+            removed_by_domain = 0
+            if normalized_domains:
+                results, removed_by_domain = filter_search_results_by_domains(results, normalized_domains)
+            usable_result_count = len(results[:max_results])
+            await status.add(f"cc-web: {backend} returned {usable_result_count} usable results")
+            if usable_result_count == 0 and provider_index < len(providers) - 1:
+                reason = "empty_results"
+                if normalized_domains and removed_by_domain:
+                    reason = f"empty_results_after_domain_filter: raw={raw_result_count}, removed={removed_by_domain}"
+                raise EmptySearchResultsError(reason)
+            attempted_backends.append({"backend": backend, "ok": True})
 
             response: dict[str, Any] = {
                 "ok": True,
                 "query": query,
                 "backend": backend,
-                "status_summary": f"search complete: {len(results[:max_results])} results from {backend}",
+                "status_summary": f"search complete: {usable_result_count} results from {backend}",
                 "steps": status.steps,
                 "fetched_at": now_iso(),
                 "results": results[:max_results],
                 "attempted_backends": attempted_backends,
             }
+            if normalized_domains:
+                response["domain_filter"] = {
+                    "domains": list(normalized_domains),
+                    "removed_results": removed_by_domain,
+                }
             if backend == "bing_cn":
                 response["search_scope_note"] = BING_CN_SCOPE_NOTE
             if fallback_reason:
@@ -1307,7 +1676,7 @@ async def search_web(
             if _cfg(config, "search_cache_ttl_seconds", 0) > 0:
                 response["cache"] = "miss"
                 _write_search_cache(config, search_cache_key, response)
-            return response
+            return _attach_search_ref_ids(response)
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             attempted_backends.append({"backend": backend, "ok": False, "error": last_error})
@@ -1335,18 +1704,29 @@ async def search_web(
 
 
 async def fetch_page(
-    url: str,
+    url: str | None = None,
     max_chars: int | None = None,
     start_index: int = 0,
     extract_mode: str = "auto",
+    ref_id: str | None = None,
     config: GlobalWebConfig | None = None,
     status_callback: StatusCallback | None = None,
 ) -> dict[str, Any]:
     config = config or load_config()
     status = StatusRecorder(status_callback)
     try:
+        target_url, resolved_from_ref_id = await _resolve_fetch_input(url, ref_id, status)
+    except KeyError as exc:
+        return _ref_not_found_response(str(exc.args[0]), status)
+
+    network_policy = await evaluate_network_policy_async(
+        target_url,
+        allow_private_networks=_cfg(config, "allow_private_networks", False),
+        trusted_proxy_domains=_cfg(config, "trusted_proxy_domains", ()),
+    )
+    try:
         safe_url = await validate_fetch_url_async(
-            url,
+            target_url,
             allow_private_networks=_cfg(config, "allow_private_networks", False),
             trusted_proxy_domains=_cfg(config, "trusted_proxy_domains", ()),
         )
@@ -1354,12 +1734,15 @@ async def fetch_page(
         await status.add("cc-web: fetch blocked by URL safety policy")
         result = {
             "ok": False,
-            "url": url,
+            "url": target_url,
             "error": str(exc),
             "error_type": "fetch_safety",
             "status_summary": "fetch failed: URL safety policy",
             "steps": status.steps,
+            "network_policy": network_policy,
         }
+        if resolved_from_ref_id:
+            result["resolved_from_ref_id"] = resolved_from_ref_id
         result.update(_fetch_failure_guidance("fetch_safety"))
         return result
 
@@ -1379,6 +1762,7 @@ async def fetch_page(
             content_type = str(cached.get("content_type", ""))
             reader_url = str(cached.get("reader_url", ""))
             fallback_reason = str(cached.get("fallback_reason", ""))
+            redirect_count = int(cached.get("redirect_count", 0) or 0)
             cache_state = "hit"
         else:
             async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT, max_redirects=5) as client:
@@ -1403,6 +1787,7 @@ async def fetch_page(
                         raise FetchDiagnosticError(diagnostics["recommendation"], diagnostics)
                     backend = "direct"
                     status_code: int | None = response.status_code
+                    redirect_count = int(response.extensions.get("cc_web_redirect_count", 0) or 0)
 
                     if _cfg(config, "enable_jina_fallback", True) and len(markdown_full) < _cfg(config, "jina_min_chars", 300):
                         fallback_reason = f"direct content too short: {len(markdown_full)} chars"
@@ -1440,6 +1825,7 @@ async def fetch_page(
                     final_url = safe_url
                     status_code = None
                     content_type = "text/markdown"
+                    redirect_count = 0
             cache_state = "miss"
             if backend != "jina_reader":
                 _write_cache(
@@ -1453,6 +1839,7 @@ async def fetch_page(
                         "content_type": content_type,
                         "reader_url": reader_url,
                         "fallback_reason": fallback_reason,
+                        "redirect_count": redirect_count,
                     },
                 )
 
@@ -1473,7 +1860,11 @@ async def fetch_page(
             "truncated": window["truncated"],
             "next_start_index": window["next_start_index"],
             "cache": cache_state,
+            "network_policy": network_policy,
+            "redirect_count": redirect_count,
         }
+        if resolved_from_ref_id:
+            result["resolved_from_ref_id"] = resolved_from_ref_id
         if reader_url:
             result["reader_url"] = reader_url
         if fallback_reason:
@@ -1493,7 +1884,10 @@ async def fetch_page(
             "error_type": error_type,
             "status_summary": f"fetch failed: {error_type}",
             "steps": status.steps,
+            "network_policy": network_policy,
         }
+        if resolved_from_ref_id:
+            result["resolved_from_ref_id"] = resolved_from_ref_id
         if diagnostics:
             result["fetch_diagnostics"] = diagnostics
         result.update(_fetch_failure_guidance(error_type, diagnostics.get("recommendation") if diagnostics else None))
@@ -1506,6 +1900,7 @@ async def research_brief(
     max_chars_per_source: int | None = None,
     region: str = "wt-wt",
     language: str = "zh-cn",
+    domains: tuple[str, ...] | list[str] | str | None = None,
     config: GlobalWebConfig | None = None,
     status_callback: StatusCallback | None = None,
 ) -> dict[str, Any]:
@@ -1523,6 +1918,7 @@ async def research_brief(
         max_results=max(_cfg(config, "max_search_results", 10), max_sources),
         region=region,
         language=language,
+        domains=domains,
         config=config,
         status_callback=status.add,
     )
@@ -1614,7 +2010,7 @@ async def research_brief(
 
     sources = await asyncio.gather(*(fetch_source(index, result) for index, result in enumerate(selected_results, start=1)))
 
-    return {
+    result = {
         "ok": True,
         "query": query,
         "backend": search.get("backend", "unknown"),
@@ -1624,6 +2020,9 @@ async def research_brief(
         "sources": sources,
         "skipped_results": skipped_results,
     }
+    if search.get("domain_filter"):
+        result["domain_filter"] = search["domain_filter"]
+    return result
 
 
 async def check_health(config_path: str | Path | None = None) -> dict[str, Any]:
@@ -1644,6 +2043,13 @@ async def check_health(config_path: str | Path | None = None) -> dict[str, Any]:
             "httpx": True,
             "beautifulsoup4": True,
             "markdownify": True,
+        },
+        "network_policy": {
+            "allow_private_networks": config.allow_private_networks,
+            "blocked_networks": [str(network) for network in BLOCKED_IP_NETWORKS],
+            "trusted_proxy_networks": [str(network) for network in TRUSTED_PROXY_IP_NETWORKS],
+            "trusted_proxy_domains": list(config.trusted_proxy_domains),
+            "resolve_dns": True,
         },
         "network": {},
     }

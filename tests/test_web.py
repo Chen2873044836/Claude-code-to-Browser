@@ -59,6 +59,23 @@ def test_rank_search_results_prioritizes_authoritative_technical_sources():
     ]
 
 
+def test_filter_search_results_by_domains_keeps_matching_hosts():
+    results = [
+        {"title": "Docs", "url": "https://docs.example.com/guide", "snippet": "docs"},
+        {"title": "Blog", "url": "https://blog.example.net/post", "snippet": "blog"},
+        {"title": "API", "url": "https://api.example.com/v1", "snippet": "api"},
+        {"title": "Invalid", "url": "not-a-url", "snippet": "bad"},
+    ]
+
+    filtered, removed = web.filter_search_results_by_domains(results, ("example.com",))
+
+    assert removed == 2
+    assert [item["url"] for item in filtered] == [
+        "https://docs.example.com/guide",
+        "https://api.example.com/v1",
+    ]
+
+
 def test_normalize_searxng_results():
     payload = {
         "results": [
@@ -154,6 +171,33 @@ def test_normalize_bing_cn_results():
     ]
 
 
+def test_normalize_bing_cn_results_unwraps_bing_redirect_url():
+    html = """
+    <html><body>
+      <ol id="b_results">
+        <li class="b_algo">
+          <h2>
+            <a href="https://www.bing.com/ck/a?!&&p=abc&u=a1aHR0cHM6Ly9kb2NzLnB5dGhvbi5vcmcvMy8&ntb=1">
+              Python Docs
+            </a>
+          </h2>
+          <p>Official Python documentation.</p>
+        </li>
+      </ol>
+    </body></html>
+    """
+
+    results = web.normalize_bing_cn_results(html, max_results=1)
+
+    assert results == [
+        {
+            "title": "Python Docs",
+            "url": "https://docs.python.org/3/",
+            "snippet": "Official Python documentation.",
+        }
+    ]
+
+
 def test_search_web_uses_searxng_provider(monkeypatch):
     class Config:
         search_provider = "searxng"
@@ -234,6 +278,54 @@ def test_search_web_uses_mojeek_provider(monkeypatch):
     assert result["ok"] is True
     assert result["backend"] == "mojeek"
     assert result["results"][0]["url"] == "https://example.com/mojeek"
+
+
+def test_search_web_filters_results_by_domains_and_adds_ref_ids(monkeypatch):
+    class Config:
+        search_provider = "mojeek"
+        search_providers = ("mojeek",)
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+
+    seen_queries = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            seen_queries.append(params["q"])
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <a class="title" href="https://docs.example.com/guide">Docs Result</a>
+                  <p class="s">docs snippet</p>
+                  <a class="title" href="https://other.example.net/post">Other Result</a>
+                  <p class="s">other snippet</p>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web, "_BROWSE_SESSION", web.BrowseSession())
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=5, domains=["example.com"], config=Config()))
+
+    assert "site:example.com" in seen_queries[0]
+    assert result["ok"] is True
+    assert result["domain_filter"] == {"domains": ["example.com"], "removed_results": 1}
+    assert [item["url"] for item in result["results"]] == ["https://docs.example.com/guide"]
+    assert result["results"][0]["ref_id"].startswith("ccweb-search-")
 
 
 def test_search_web_falls_back_to_searxng_html_when_json_fails(monkeypatch):
@@ -332,6 +424,168 @@ def test_search_web_falls_back_to_bing_cn_when_duckduckgo_fails(monkeypatch):
     assert result["attempted_backends"][0]["ok"] is False
     assert result["attempted_backends"][1] == {"backend": "bing_cn", "ok": True}
     assert result["results"][0]["url"] == "https://github.com/modelcontextprotocol/servers"
+
+
+def test_search_web_falls_back_when_provider_returns_empty_results(monkeypatch):
+    class Config:
+        search_provider = "duckduckgo"
+        search_providers = ("duckduckgo", "bing_cn")
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            if "duckduckgo.com" in url:
+                return httpx.Response(
+                    200,
+                    text="<html><body><p>No parsed results</p></body></html>",
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <ol id="b_results">
+                    <li class="b_algo">
+                      <h2><a href="https://docs.python.org/3/">Python Docs</a></h2>
+                      <p>Official docs.</p>
+                    </li>
+                  </ol>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("python docs", max_results=3, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "bing_cn"
+    assert result["attempted_backends"][0]["backend"] == "duckduckgo_html"
+    assert result["attempted_backends"][0]["ok"] is False
+    assert "empty_results" in result["attempted_backends"][0]["error"]
+    assert result["results"][0]["url"] == "https://docs.python.org/3/"
+
+
+def test_search_web_falls_back_when_duckduckgo_returns_js_challenge(monkeypatch):
+    class Config:
+        search_provider = "duckduckgo"
+        search_providers = ("duckduckgo", "bing_cn")
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            if "duckduckgo.com" in url:
+                return httpx.Response(
+                    202,
+                    text="""
+                    <html><body>
+                      <div class="anomaly-modal">Unfortunately, bots use DuckDuckGo too.</div>
+                      <form id="challenge-form" action="/anomaly.js"></form>
+                    </body></html>
+                    """,
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <li class="b_algo">
+                    <h2><a href="https://docs.python.org/3/">Python Docs</a></h2>
+                    <p>Official docs.</p>
+                  </li>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("python docs", max_results=3, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "bing_cn"
+    assert result["attempted_backends"][0]["backend"] == "duckduckgo_html"
+    assert result["attempted_backends"][0]["ok"] is False
+    assert "duckduckgo_challenge" in result["attempted_backends"][0]["error"]
+    assert result["results"][0]["url"] == "https://docs.python.org/3/"
+
+
+def test_search_web_domain_filter_uses_unwrapped_bing_urls(monkeypatch):
+    class Config:
+        search_provider = "bing_cn"
+        search_providers = ("bing_cn",)
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <li class="b_algo">
+                    <h2>
+                      <a href="https://www.bing.com/ck/a?!&&p=abc&u=a1aHR0cHM6Ly9kb2NzLnB5dGhvbi5vcmcvMy8&ntb=1">
+                        Python Docs
+                      </a>
+                    </h2>
+                    <p>Official docs.</p>
+                  </li>
+                  <li class="b_algo">
+                    <h2><a href="https://example.net/other">Other</a></h2>
+                    <p>Other result.</p>
+                  </li>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web, "_BROWSE_SESSION", web.BrowseSession())
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("python docs", max_results=3, domains=["python.org"], config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "bing_cn"
+    assert result["domain_filter"] == {"domains": ["python.org"], "removed_results": 1}
+    assert result["results"][0]["url"] == "https://docs.python.org/3/"
+    assert result["results"][0]["ref_id"].startswith("ccweb-search-")
 
 
 def test_search_web_uses_short_ttl_success_cache(monkeypatch, tmp_path):
@@ -630,6 +884,7 @@ def test_check_health_marks_rate_limited_search_backend_unavailable(monkeypatch,
 
     assert health["search_backend_status"]["mojeek"] == {"ok": False, "status": 429}
     assert health["first_available_search_backend"] == "bing_cn"
+    assert "198.18.0.0/15" in health["network_policy"]["blocked_networks"]
 
 
 def test_validate_fetch_url_only_allows_http_and_https(public_dns):
@@ -720,6 +975,17 @@ def test_validate_fetch_url_allows_trusted_proxy_benchmark_address_resolution(mo
     assert validate_fetch_url("https://github.com/repo", trusted_proxy_domains=("github.com",)) == "https://github.com/repo"
 
 
+def test_evaluate_network_policy_records_blocked_dns_resolution(monkeypatch):
+    monkeypatch.setattr(web.socket, "getaddrinfo", lambda *args, **kwargs: [(None, None, None, None, ("127.0.0.1", 443))])
+
+    decision = web.evaluate_network_policy("https://example.com/private")
+
+    assert decision["allowed"] is False
+    assert decision["reason"] == "restricted_dns"
+    assert decision["resolved_ips"] == ["127.0.0.1"]
+    assert decision["blocked_ips"] == ["127.0.0.1"]
+
+
 def test_build_fetch_target_pins_validated_ip_and_keeps_tls_hostname(monkeypatch):
     monkeypatch.setattr(web.socket, "getaddrinfo", lambda *args, **kwargs: [(None, None, None, None, ("93.184.216.34", 443))])
 
@@ -754,6 +1020,72 @@ def test_limited_get_uses_fetch_target_and_preserves_original_url(monkeypatch):
     assert seen_requests[0].url == "http://93.184.216.34/docs?q=1"
     assert seen_requests[0].headers["host"] == "example.com"
     assert response.url == "http://example.com/docs?q=1"
+
+
+def test_fetch_page_resolves_search_ref_id_and_returns_network_policy(monkeypatch, public_dns):
+    monkeypatch.setattr(web, "_BROWSE_SESSION", web.BrowseSession())
+    ref_id = web._BROWSE_SESSION.add("search", "https://example.com/docs", title="Docs")
+
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 2000
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+        enable_jina_fallback = False
+
+    async def fake_limited_get(client, url, allow_private_networks=False, trusted_proxy_domains=None):
+        return httpx.Response(
+            200,
+            content=b"<html><body><main><p>Hello ref</p></main></body></html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+
+    result = asyncio.run(web.fetch_page(ref_id=ref_id, config=Config()))
+
+    assert result["ok"] is True
+    assert result["url"] == "https://example.com/docs"
+    assert result["resolved_from_ref_id"] == ref_id
+    assert result["network_policy"]["allowed"] is True
+    assert result["network_policy"]["resolved_ips"] == ["93.184.216.34"]
+    assert result["redirect_count"] == 0
+
+
+def test_fetch_page_accepts_ref_id_in_url_parameter(monkeypatch, public_dns):
+    monkeypatch.setattr(web, "_BROWSE_SESSION", web.BrowseSession())
+    ref_id = web._BROWSE_SESSION.add("search", "https://example.com/docs", title="Docs")
+
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 2000
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+        enable_jina_fallback = False
+
+    async def fake_limited_get(client, url, allow_private_networks=False, trusted_proxy_domains=None):
+        return httpx.Response(
+            200,
+            content=b"<html><body><main><p>Hello ref</p></main></body></html>",
+            headers={"content-type": "text/html"},
+            request=httpx.Request("GET", url),
+        )
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+
+    result = asyncio.run(web.fetch_page(url=ref_id, config=Config()))
+
+    assert result["ok"] is True
+    assert result["resolved_from_ref_id"] == ref_id
+
+
+def test_fetch_page_returns_ref_not_found_for_unknown_ref_id():
+    result = asyncio.run(web.fetch_page(ref_id="ccweb-search-missing"))
+
+    assert result["ok"] is False
+    assert result["error_type"] == "ref_not_found"
+    assert result["retryable"] is False
 
 
 def test_extract_markdown_converts_relative_links_to_absolute():

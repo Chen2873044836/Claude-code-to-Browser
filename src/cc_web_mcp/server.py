@@ -70,23 +70,31 @@ async def _finish_progress(ctx: Context | None) -> None:
 
 
 @mcp.tool()
-async def web_search(query: str, max_results: int = 5, region: str = "wt-wt", language: str = "zh-cn", ctx: Context = None) -> str:
+async def web_search(
+    query: str,
+    max_results: int = 5,
+    region: str = "wt-wt",
+    language: str = "zh-cn",
+    domains: list[str] | None = None,
+    ctx: Context = None,
+) -> str:
     """仅供缺少原生 WebSearch 的第三方模型搜索公开网页；官方 Claude 应使用内置 WebSearch。"""
-    result = await search_web(query, max_results, region, language, status_callback=_progress_callback(ctx))
+    result = await search_web(query, max_results, region, language, domains=domains, status_callback=_progress_callback(ctx))
     await _finish_progress(ctx)
     return to_json_text(result)
 
 
 @mcp.tool()
 async def fetch_url(
-    url: str,
+    url: str | None = None,
     max_chars: int | None = None,
     start_index: int = 0,
     extract_mode: str = "auto",
+    ref_id: str | None = None,
     ctx: Context = None,
 ) -> str:
     """抓取 http/https URL 正文并转为 Markdown；官方 Claude 默认应使用内置 WebFetch，除非用户显式要求 cc-web 或配置允许。"""
-    result = await fetch_page(url, max_chars, start_index, extract_mode, status_callback=_progress_callback(ctx))
+    result = await fetch_page(url, max_chars, start_index, extract_mode, ref_id=ref_id, status_callback=_progress_callback(ctx))
     await _finish_progress(ctx)
     return to_json_text(result)
 
@@ -98,6 +106,7 @@ async def research_brief(
     max_chars_per_source: int | None = None,
     region: str = "wt-wt",
     language: str = "zh-cn",
+    domains: list[str] | None = None,
     ctx: Context = None,
 ) -> str:
     """仅供缺少原生 WebSearch/WebFetch 的第三方模型做上下文友好的资料概览；官方 Claude 应使用内置工具。"""
@@ -107,6 +116,7 @@ async def research_brief(
         max_chars_per_source,
         region,
         language,
+        domains=domains,
         status_callback=_progress_callback(ctx),
     )
     await _finish_progress(ctx)
