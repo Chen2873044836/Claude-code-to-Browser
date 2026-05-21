@@ -47,6 +47,25 @@ def test_normalize_search_results_from_duckduckgo_html():
     ]
 
 
+def test_normalize_search_results_from_duckduckgo_lite():
+    html = """
+    <html><body>
+      <a rel="nofollow" href="/l/?uddg=https%3A%2F%2Fexample.com%2Flight">Lite Result</a>
+      <td class="result-snippet">Lite snippet</td>
+    </body></html>
+    """
+
+    results = web.normalize_duckduckgo_lite_results(html, max_results=1)
+
+    assert results == [
+        {
+            "title": "Lite Result",
+            "url": "https://example.com/light",
+            "snippet": "Lite snippet",
+        }
+    ]
+
+
 def test_rank_search_results_prioritizes_authoritative_technical_sources():
     results = [
         {"title": "SEO 1", "url": "https://seo1.example/post", "snippet": "mirror"},
@@ -648,6 +667,115 @@ def test_search_web_falls_back_when_duckduckgo_returns_js_challenge(monkeypatch)
     assert result["attempted_backends"][0]["ok"] is False
     assert "duckduckgo_challenge" in result["attempted_backends"][0]["error"]
     assert result["results"][0]["url"] == "https://docs.python.org/3/"
+
+
+def test_search_web_duckduckgo_falls_back_from_post_to_get(monkeypatch):
+    class Config:
+        search_provider = "duckduckgo"
+        search_providers = ("duckduckgo",)
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, data=None, follow_redirects=True):
+            calls.append(("POST", url, dict(data or {})))
+            return httpx.Response(
+                202,
+                text="<form id='challenge-form' action='/anomaly.js'></form>",
+                request=httpx.Request("POST", url),
+            )
+
+        async def get(self, url, params=None, follow_redirects=True):
+            calls.append(("GET", url, dict(params or {})))
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <a class="result__a" href="https://example.com/get">GET Result</a>
+                  <a class="result__snippet">fallback result</a>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=2, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "duckduckgo_html"
+    assert result["results"][0]["url"] == "https://example.com/get"
+    assert calls[0] == ("POST", "https://html.duckduckgo.com/html/", {"q": "mcp docs", "b": "", "l": "wt-wt"})
+    assert calls[1] == ("GET", "https://html.duckduckgo.com/html/", {"q": "mcp docs", "kl": "wt-wt"})
+
+
+def test_search_web_duckduckgo_uses_lite_when_html_attempts_fail(monkeypatch):
+    class Config:
+        search_provider = "duckduckgo"
+        search_providers = ("duckduckgo",)
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, data=None, follow_redirects=True):
+            calls.append(("POST", url))
+            if "lite.duckduckgo.com" in url:
+                return httpx.Response(
+                    200,
+                    text="""
+                    <html><body>
+                      <a rel="nofollow" href="/l/?uddg=https%3A%2F%2Fexample.com%2Flight">Lite Result</a>
+                      <td class="result-snippet">Lite snippet</td>
+                    </body></html>
+                    """,
+                    request=httpx.Request("POST", url),
+                )
+            raise httpx.ConnectError("blocked", request=httpx.Request("POST", url))
+
+        async def get(self, url, params=None, follow_redirects=True):
+            calls.append(("GET", url))
+            raise httpx.ConnectError("blocked", request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=2, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "duckduckgo_lite"
+    assert result["results"][0]["url"] == "https://example.com/light"
+    assert calls == [
+        ("POST", "https://html.duckduckgo.com/html/"),
+        ("GET", "https://html.duckduckgo.com/html/"),
+        ("POST", "https://lite.duckduckgo.com/lite/"),
+    ]
 
 
 def test_search_web_domain_filter_uses_unwrapped_bing_urls(monkeypatch):

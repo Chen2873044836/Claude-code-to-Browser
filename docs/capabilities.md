@@ -22,6 +22,8 @@
 
 当前搜索后端包括 `duckduckgo`、`bing`、`bing_cn`、`searxng`、`mojeek` 和配置驱动的 `custom:<name>`。默认链路会先尝试 DuckDuckGo，再尝试国际版 Bing，最后才用 `bing_cn` 兜底。SearXNG 会优先使用 JSON 接口，JSON 被实例限流或关闭时会降级读取 HTML 结果页；Mojeek 使用公开 HTML 搜索入口，适合作为轻量 fallback；自定义后端适合接入第三方搜索 API 或自建搜索网关。
 
+DuckDuckGo 后端内部会先尝试 HTML POST，再降级到 HTML GET，最后尝试 DuckDuckGo Lite 页面；这些都是公开网页入口，不需要 API key。HTTP/2 和 TLS 指纹随机化这类底层实验能力没有默认启用，避免把搜索稳定性建立在脆弱的私有实现细节上。
+
 自定义后端会自动尝试常见 JSON 路径和字段名，也会在 `health_check` 中返回 `raw_result_count`、`usable_result_count`、命中的字段路径和业务错误信息。手动接 API 时，可以用 `cc-web-mcp config test-search custom:<name> "query"` 在命令行里先验证配置，再交给 Claude Code 实机调用。
 
 如果开启 `search_parallel_enabled`，`web_search` 会并发请求前几个可用后端并去重合并结果，返回 `backend: "parallel:..."`、`aggregation.successful_backends`，并在重复命中的结果项里标注 `source_backends`。这个模式更接近 ddgs 的元搜索思路，适合网络不稳定但可以接受多发几个公开搜索请求的场景。

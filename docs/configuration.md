@@ -84,6 +84,8 @@ cc-web-mcp config init
 "search_providers": ["duckduckgo", "bing", "bing_cn"]
 ```
 
+`duckduckgo` 后端内部会先尝试 DuckDuckGo HTML POST，再尝试 HTML GET，最后尝试 DuckDuckGo Lite 页面。这样能吸收 ddgs 的公开入口降级思路，同时避免默认启用 HTTP/2/TLS 底层指纹随机化这类维护风险更高的实验手段。
+
 如果当前网络无法访问 DuckDuckGo，可以保留默认降级链路，也可以直接只使用 Bing 中文入口：
 
 ```json

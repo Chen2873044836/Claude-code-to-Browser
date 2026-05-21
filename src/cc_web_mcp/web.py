@@ -30,6 +30,11 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+SEARCH_USER_AGENTS = (
+    USER_AGENT,
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+)
 MAX_DOWNLOAD_BYTES = 5_000_000
 REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
 DEFAULT_CONFIG_PATH = resolve_config_path()
@@ -1055,6 +1060,17 @@ def _headers() -> dict[str, str]:
     }
 
 
+def _search_headers(language: str = "zh-cn") -> dict[str, str]:
+    index_seed = int(time.time() * 1000)
+    user_agent = SEARCH_USER_AGENTS[index_seed % len(SEARCH_USER_AGENTS)]
+    return {
+        **_headers(),
+        "User-Agent": user_agent,
+        "Accept-Language": language or "zh-cn",
+        "Referer": "https://duckduckgo.com/",
+    }
+
+
 def _duckduckgo_result_url(raw_url: str) -> str:
     parsed = urlparse(raw_url)
     if "duckduckgo.com" in parsed.netloc.lower() and parsed.path.startswith("/l/"):
@@ -1130,6 +1146,41 @@ def normalize_search_results(html: str, max_results: int = 5) -> list[dict[str, 
                 snippet = _clean_text(next_snippet.get_text(" "))
 
         results.append(SearchResult(title=title, url=_duckduckgo_result_url(href), snippet=snippet))
+        if len(results) >= max_results:
+            break
+
+    return [result.__dict__ for result in results]
+
+
+def normalize_duckduckgo_lite_results(html: str, max_results: int = 5) -> list[dict[str, str]]:
+    soup = BeautifulSoup(html, "html.parser")
+    results: list[SearchResult] = []
+    seen_urls: set[str] = set()
+
+    for anchor in soup.select("a[href]"):
+        href = str(anchor.get("href") or "").strip()
+        title = _clean_text(anchor.get_text(" "))
+        if not title or not href:
+            continue
+        if href.startswith(("#", "javascript:")):
+            continue
+        if "/l/?" not in href and not href.startswith(("http://", "https://")):
+            continue
+
+        url = _duckduckgo_result_url(urljoin("https://lite.duckduckgo.com", href))
+        if not url.startswith(("http://", "https://")) or url in seen_urls:
+            continue
+
+        snippet = ""
+        parent = anchor.find_parent(["tr", "td", "div"])
+        snippet_node = parent.find_next(class_=re.compile(r"result-snippet|snippet")) if parent else None
+        if not snippet_node:
+            snippet_node = anchor.find_next(class_=re.compile(r"result-snippet|snippet"))
+        if snippet_node:
+            snippet = _clean_text(snippet_node.get_text(" "))
+
+        results.append(SearchResult(title=title, url=url, snippet=snippet))
+        seen_urls.add(url)
         if len(results) >= max_results:
             break
 
@@ -1295,6 +1346,57 @@ def _validate_custom_search_api_payload(payload: Any, spec: dict[str, Any]) -> N
     message = _get_by_dot_path_candidates(payload, spec.get("message_path", "message"), "")
     detail = f": {message}" if message else ""
     raise SearchBackendUnavailableError(f"custom api response code mismatch: {actual_code}{detail}")
+
+
+async def _search_duckduckgo(
+    query: str,
+    max_results: int,
+    region: str,
+    language: str,
+) -> tuple[str, list[dict[str, str]]]:
+    attempts = (
+        (
+            "duckduckgo_html_post",
+            "POST",
+            "https://html.duckduckgo.com/html/",
+            {"q": query, "b": "", "l": region or "wt-wt"},
+            normalize_search_results,
+        ),
+        (
+            "duckduckgo_html_get",
+            "GET",
+            "https://html.duckduckgo.com/html/",
+            {"q": query, "kl": region or "wt-wt"},
+            normalize_search_results,
+        ),
+        (
+            "duckduckgo_lite",
+            "POST",
+            "https://lite.duckduckgo.com/lite/",
+            {"q": query, "kl": region or "wt-wt"},
+            normalize_duckduckgo_lite_results,
+        ),
+    )
+    errors: list[str] = []
+    async with httpx.AsyncClient(headers=_search_headers(language), timeout=REQUEST_TIMEOUT, max_redirects=5) as client:
+        for attempt_name, method, url, payload, parser in attempts:
+            try:
+                if method == "POST":
+                    response = await client.post(url, data=payload, follow_redirects=True)
+                else:
+                    response = await client.get(url, params=payload, follow_redirects=True)
+                challenge_reason = _duckduckgo_challenge_reason(response.status_code, response.text)
+                if challenge_reason:
+                    raise SearchBackendUnavailableError(challenge_reason)
+                response.raise_for_status()
+                results = parser(response.text, max_results=max_results)
+                if not results:
+                    raise EmptySearchResultsError("empty_results")
+                backend = "duckduckgo_lite" if attempt_name == "duckduckgo_lite" else "duckduckgo_html"
+                return backend, results
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{attempt_name}: {type(exc).__name__}: {exc}")
+    raise SearchBackendUnavailableError("duckduckgo attempts failed: " + "; ".join(errors))
 
 
 def normalize_mojeek_results(html: str, max_results: int = 5) -> list[dict[str, str]]:
@@ -1611,21 +1713,7 @@ async def _search_with_provider(
             return "bing_cn", normalize_bing_cn_results(response.text, max_results=max_results)
 
     if provider == "duckduckgo":
-        async with httpx.AsyncClient(
-            headers={**_headers(), "Accept-Language": language or "zh-cn"},
-            timeout=REQUEST_TIMEOUT,
-            max_redirects=5,
-        ) as client:
-            response = await client.get(
-                "https://html.duckduckgo.com/html/",
-                params={"q": query, "kl": region or "wt-wt"},
-                follow_redirects=True,
-            )
-            challenge_reason = _duckduckgo_challenge_reason(response.status_code, response.text)
-            if challenge_reason:
-                raise SearchBackendUnavailableError(challenge_reason)
-            response.raise_for_status()
-            return "duckduckgo_html", normalize_search_results(response.text, max_results=max_results)
+        return await _search_duckduckgo(query, max_results=max_results, region=region, language=language)
 
     if provider == "mojeek":
         async with httpx.AsyncClient(
