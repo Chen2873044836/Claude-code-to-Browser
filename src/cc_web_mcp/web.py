@@ -1498,9 +1498,13 @@ def _technical_source_score(url: str) -> int:
     return score
 
 
-def rank_search_results(results: list[dict[str, str]]) -> list[dict[str, str]]:
+def rank_search_results(results: list[dict[str, str]], query: str = "") -> list[dict[str, str]]:
     ranked = list(results)
-    scores = {id(item): _technical_source_score(item.get("url", "")) for item in ranked}
+    query_terms = _search_query_terms(query)
+    scores = {
+        id(item): _technical_source_score(item.get("url", "")) + _search_result_query_score(item, query_terms)
+        for item in ranked
+    }
 
     for index in range(1, len(ranked)):
         current = ranked[index]
@@ -1589,6 +1593,17 @@ def _query_result_relevance_score(query: str, results: list[dict[str, str]], lim
         )
         matched_terms.update(term for term in terms if term in haystack)
     return len(matched_terms)
+
+
+def _search_result_query_score(result: dict[str, str], terms: list[str]) -> int:
+    if not terms:
+        return 0
+    haystack = " ".join(
+        str(result.get(field) or "").lower()
+        for field in ("title", "snippet", "url")
+    )
+    matched = sum(1 for term in terms[:6] if term in haystack)
+    return matched * 12
 
 
 def _should_retry_search_with_short_query(query: str, results: list[dict[str, str]]) -> str | None:
@@ -2589,7 +2604,7 @@ async def _search_web_parallel(
     results = _merge_parallel_search_results(successful_results)
     raw_result_count = len(results[:provider_result_limit])
     if _cfg(config, "prefer_technical_sources", True):
-        results = rank_search_results(results)
+        results = rank_search_results(results, provider_query)
     removed_by_domain = 0
     if normalized_domains:
         results, removed_by_domain = filter_search_results_by_domains(results, normalized_domains)
@@ -2915,7 +2930,7 @@ async def search_web(
             raw_result_count = len(results[:provider_result_limit])
 
             if _cfg(config, "prefer_technical_sources", True):
-                results = rank_search_results(results)
+                results = rank_search_results(results, provider_query)
             removed_by_domain = 0
             if normalized_domains:
                 results, removed_by_domain = filter_search_results_by_domains(results, normalized_domains)

@@ -86,6 +86,21 @@ def test_rank_search_results_prioritizes_authoritative_technical_sources():
     ]
 
 
+def test_rank_search_results_uses_query_relevance():
+    results = [
+        {"title": "Redis 教程 | 菜鸟教程", "url": "https://www.runoob.com/redis/", "snippet": "Redis 教程。"},
+        {
+            "title": "Redis Cluster vs Sentinel 模式区别",
+            "url": "https://zhuanlan.zhihu.com/p/redis",
+            "snippet": "Redis Cluster 与 Redis Sentinel 的高可用模式对比。",
+        },
+    ]
+
+    ranked = web.rank_search_results(results, query="Redis cluster vs sentinel high availability comparison")
+
+    assert ranked[0]["url"] == "https://zhuanlan.zhihu.com/p/redis"
+
+
 def test_filter_search_results_by_domains_keeps_matching_hosts():
     results = [
         {"title": "Docs", "url": "https://docs.example.com/guide", "snippet": "docs"},
@@ -691,6 +706,80 @@ def test_search_web_retries_provider_with_short_query_when_long_query_drifts(mon
     assert result["query_retry"]["query"] == "raft consensus algorithm"
     assert result["query_retry"]["backend"] == "bing_cn"
     assert result["results"][0]["url"] == "https://raft.github.io/"
+
+
+def test_search_web_retries_provider_when_comparison_query_drifts(monkeypatch):
+    class Config:
+        search_provider = "bing_cn"
+        search_providers = ("bing_cn",)
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = True
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+        search_parallel_enabled = False
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            calls.append(params["q"])
+            if params["q"] == "redis cluster vs sentinel":
+                return httpx.Response(
+                    200,
+                    text="""
+                    <html><body>
+                      <li class="b_algo">
+                        <h2><a href="https://zhuanlan.zhihu.com/p/redis">Redis Cluster vs Sentinel 模式区别</a></h2>
+                        <p>Redis Cluster 与 Redis Sentinel 的高可用模式对比。</p>
+                      </li>
+                    </body></html>
+                    """,
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <li class="b_algo">
+                    <h2><a href="https://www.runoob.com/redis/redis-tutorial.html">Redis 教程 | 菜鸟教程</a></h2>
+                    <p>Redis 是一个高性能的 key-value 数据库。</p>
+                  </li>
+                  <li class="b_algo">
+                    <h2><a href="https://redis.io/">Redis - Real-time data for apps</a></h2>
+                    <p>Redis official site.</p>
+                  </li>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(
+        web.search_web(
+            "Redis cluster vs sentinel high availability comparison 2025",
+            max_results=3,
+            config=Config(),
+        )
+    )
+
+    assert calls == [
+        "Redis cluster vs sentinel high availability comparison 2025",
+        "redis cluster vs sentinel",
+    ]
+    assert result["ok"] is True
+    assert result["query_retry"]["query"] == "redis cluster vs sentinel"
+    assert result["results"][0]["url"] == "https://zhuanlan.zhihu.com/p/redis"
 
 
 def test_short_search_retry_query_preserves_vs_comparison():
