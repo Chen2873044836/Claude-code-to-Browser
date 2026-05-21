@@ -20,7 +20,7 @@
 
 这样模型可以继续拿到可用资料，同时知道当前不是完整的 DuckDuckGo/全球搜索结果。
 
-当前搜索后端包括 `duckduckgo`、`bing`、`bing_cn`、`searxng`、`mojeek` 和配置驱动的 `custom:<name>`。默认链路会先尝试 DuckDuckGo，再尝试国际版 Bing，最后才用 `bing_cn` 兜底。SearXNG 会优先使用 JSON 接口，JSON 被实例限流或关闭时会降级读取 HTML 结果页；Mojeek 使用公开 HTML 搜索入口，适合作为轻量 fallback；自定义后端适合接入第三方搜索 API 或自建搜索网关。
+当前搜索后端包括 `duckduckgo`、`bing`、`bing_cn`、`searxng`、`mojeek` 和配置驱动的 `custom:<name>`。默认链路会先尝试 DuckDuckGo，再尝试国际版 Bing，最后才用 `bing_cn` 兜底。SearXNG 会优先使用 JSON 接口，JSON 被实例限流或关闭时会降级读取 HTML 结果页；Mojeek 的公开 HTML 搜索入口可能返回 403，保留为显式配置的实验后端，不建议放入默认 fallback 链；自定义后端适合接入第三方搜索 API 或自建搜索网关。
 
 DuckDuckGo 后端内部会先尝试 HTML POST，再降级到 HTML GET，最后尝试 DuckDuckGo Lite 页面；这些都是公开网页入口，不需要 API key。HTTP/2 和 TLS 指纹随机化这类底层实验能力没有默认启用，避免把搜索稳定性建立在脆弱的私有实现细节上。
 

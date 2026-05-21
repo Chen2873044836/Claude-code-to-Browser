@@ -9,7 +9,7 @@
 - 第三方模型误选防护：通过 `CLAUDE.md` 指令预防 DeepSeek、Qwen、Kimi 等匹配模型误走原生 `WebSearch`；通过 `block_native_web_for_allowed_models` 和 hook 兜底拦截本地可达的 `WebFetch`。
 - 内容类型分流：HTML、纯文本、Markdown、JSON 已分流处理；PDF 和未知二进制类型默认拒绝。
 - 相对链接转绝对链接：Markdown 转换前会把 `<a href>` 解析成绝对链接。
-- 搜索后端可插拔：已支持 `duckduckgo`、`bing_cn`、`searxng` 和 `mojeek`，默认按 `duckduckgo -> bing_cn` 降级；SearXNG JSON 不可用时可降级读取 HTML 结果页。
+- 搜索后端可插拔：已支持 `duckduckgo`、`bing_cn`、`searxng` 和 `mojeek`，默认按 `duckduckgo -> bing -> bing_cn` 降级；SearXNG JSON 不可用时可降级读取 HTML 结果页，Mojeek HTML 入口保留为显式配置的实验后端。
 - 可选并发聚合：开启 `search_parallel_enabled` 后，可并发请求前几个可用搜索后端，按 URL 去重合并，并标注 `source_backends`。
 - `research_brief` 提效：支持同域名去重、并发抓取、失败来源保留错误信息。
 - `research_brief` URL 过滤：搜索结果进入抓取前会过滤非法 URL，并透传搜索后端的 `backend` 字段。
@@ -24,7 +24,7 @@
 
 ## 后续计划
 
-- 当前已支持 DuckDuckGo HTML、国际版 Bing、Bing 中文入口、SearXNG、Mojeek，以及配置驱动的 `custom:<name>` 自定义搜索 API。Brave Search、Serper、Tavily、Exa 或自建搜索网关可以优先通过 `custom_search_apis` 接入；只有字段结构明显特殊、通用配置覆盖不了时，再考虑做专用后端。
+- 当前已支持 DuckDuckGo HTML、国际版 Bing、Bing 中文入口、SearXNG、Mojeek HTML，以及配置驱动的 `custom:<name>` 自定义搜索 API。Mojeek HTML 入口可能返回 403，更稳定的 Mojeek 用法应走官方 API 并通过 `custom_search_apis` 接入；Brave Search、Serper、Tavily、Exa 或自建搜索网关也可以优先通过 `custom_search_apis` 接入。只有字段结构明显特殊、通用配置覆盖不了时，再考虑做专用后端。
 - 搜索后端配置可以继续扩展为：
 
 ```json

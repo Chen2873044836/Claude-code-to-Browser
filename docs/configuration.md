@@ -95,13 +95,13 @@ cc-web-mcp config init
 
 `bing_cn` 是实用 fallback，不是完整 DuckDuckGo/全球搜索结果的等价替代。cc-web 会用 `mkt=zh-CN` 和 `setlang=zh-cn` 请求中文市场结果，避免把 cn.bing.com 切到英文搜索模式。使用 `bing_cn` 时，工具返回会包含 `search_scope_note` 提醒模型当前结果可能有区域偏置。
 
-如果你希望增加一个不依赖账号的英文公开搜索 fallback，可以把 Mojeek 放到链路后面：
+Mojeek 的公开 HTML 搜索入口在部分网络或程序化请求场景下会返回 403，因此不建议放进默认 fallback 链。如果你只是想显式试验这个后端，可以手动加入：
 
 ```json
 "search_providers": ["duckduckgo", "bing", "mojeek", "bing_cn"]
 ```
 
-`mojeek` 使用公开 HTML 搜索入口，适合作为轻量补充，不等价于付费搜索 API。
+`mojeek` 使用公开 HTML 搜索入口，不等价于官方 Search API；如果需要稳定使用 Mojeek，建议申请官方 API 后通过 `custom_search_apis` 接入。
 
 如果你有 SearXNG 实例，可以改为：
 
