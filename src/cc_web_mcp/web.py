@@ -40,7 +40,7 @@ REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
 DEFAULT_CONFIG_PATH = resolve_config_path()
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "cc-web-mcp"
 CACHE_SCHEMA_VERSION = 3
-SEARCH_CACHE_SCHEMA_VERSION = 2
+SEARCH_CACHE_SCHEMA_VERSION = 3
 BROWSE_REF_TTL_SECONDS = 1_800
 MAX_BROWSE_REFS = 200
 BING_CN_SCOPE_NOTE = "bing_cn may be region-biased and is used as fallback; it is not equivalent to full global search."
@@ -1617,7 +1617,7 @@ def _search_backend_health_request(provider: str, config: GlobalWebConfig | Any)
     if provider == "bing":
         return provider, "https://www.bing.com/search", {"q": "cc-web health", "mkt": "zh-CN", "setlang": "zh-cn"}, {}
     if provider == "bing_cn":
-        return provider, "https://cn.bing.com/search", {"q": "cc-web health", "ensearch": "1", "cc": "cn", "setlang": "zh-cn"}, {}
+        return provider, "https://cn.bing.com/search", {"q": "cc-web health", "mkt": "zh-CN", "setlang": "zh-cn"}, {}
     if provider == "duckduckgo":
         return provider, "https://html.duckduckgo.com/html/", {"q": "cc-web health", "kl": "wt-wt"}, {}
     if provider == "mojeek":
@@ -1733,7 +1733,7 @@ async def _search_with_provider(
         ) as client:
             response = await client.get(
                 "https://cn.bing.com/search",
-                params={"q": query, "ensearch": "1", "cc": "cn", "setlang": language or "zh-cn"},
+                params={"q": query, "mkt": "zh-CN", "setlang": language or "zh-cn"},
                 follow_redirects=True,
             )
             challenge_reason = _bing_challenge_reason(response.status_code, response.text)

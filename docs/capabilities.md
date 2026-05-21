@@ -24,6 +24,8 @@
 
 DuckDuckGo 后端内部会先尝试 HTML POST，再降级到 HTML GET，最后尝试 DuckDuckGo Lite 页面；这些都是公开网页入口，不需要 API key。HTTP/2 和 TLS 指纹随机化这类底层实验能力没有默认启用，避免把搜索稳定性建立在脆弱的私有实现细节上。
 
+Bing CN 后端使用中文市场参数 `mkt=zh-CN` 和 `setlang=zh-cn`，让程序请求更接近手动浏览器中文搜索；搜索缓存 schema 会随这类参数变化升级，避免旧参数产生的结果继续命中缓存。
+
 Bing 和 Bing CN 后端会检测常见验证/反爬页面，例如 captcha 表单、`/turing/captcha`、`Are you a human`、`One last step` 等页面信号。命中后会把该后端标记为失败并进入正常 fallback / cooldown 流程，避免把验证页误判成空结果。
 
 搜索后端返回 200 但解析不到预期结果结构时，也会按疑似后端失败处理并进入 cooldown。这吸收了 ddgs 的结构性失败思路：非 200、超时/连接异常、验证页、关键结构缺失都不应被当作可用搜索结果。

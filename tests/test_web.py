@@ -433,7 +433,7 @@ def test_search_web_falls_back_to_bing_cn_when_duckduckgo_fails(monkeypatch):
             if "duckduckgo.com" in url:
                 raise httpx.ConnectError("blocked", request=httpx.Request("GET", url))
             assert url == "https://cn.bing.com/search"
-            assert params["q"] == "mcp docs"
+            assert params == {"q": "mcp docs", "mkt": "zh-CN", "setlang": "zh-cn"}
             return httpx.Response(
                 200,
                 text="""
@@ -446,6 +446,9 @@ def test_search_web_falls_back_to_bing_cn_when_duckduckgo_fails(monkeypatch):
                 """,
                 request=httpx.Request("GET", url),
             )
+
+        async def post(self, url, data=None, follow_redirects=True):
+            raise httpx.ConnectError("blocked", request=httpx.Request("POST", url))
 
     monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
 
@@ -592,6 +595,7 @@ def test_search_web_reports_bing_challenge_when_no_fallback(monkeypatch):
             return False
 
         async def get(self, url, params=None, follow_redirects=True):
+            assert params == {"q": "mcp docs", "mkt": "zh-CN", "setlang": "zh-cn"}
             return httpx.Response(
                 200,
                 text="""
@@ -968,6 +972,7 @@ def test_search_web_domain_filter_uses_unwrapped_bing_urls(monkeypatch):
             return False
 
         async def get(self, url, params=None, follow_redirects=True):
+            assert params == {"q": "python docs (site:python.org)", "mkt": "zh-CN", "setlang": "zh-cn"}
             return httpx.Response(
                 200,
                 text="""
@@ -1851,7 +1856,8 @@ def test_check_health_reports_configured_search_provider_chain(monkeypatch, tmp_
         async def get(self, url, params=None, follow_redirects=True):
             if "duckduckgo.com" in url:
                 raise httpx.ConnectError("blocked", request=httpx.Request("GET", url))
-            assert params["q"] == "cc-web health"
+            if url == "https://cn.bing.com/search":
+                assert params == {"q": "cc-web health", "mkt": "zh-CN", "setlang": "zh-cn"}
             return FakeResponse(200)
 
     monkeypatch.setattr(web, "DEFAULT_CONFIG_PATH", config_path)
