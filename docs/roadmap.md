@@ -10,6 +10,7 @@
 - 内容类型分流：HTML、纯文本、Markdown、JSON 已分流处理；PDF 和未知二进制类型默认拒绝。
 - 相对链接转绝对链接：Markdown 转换前会把 `<a href>` 解析成绝对链接。
 - 搜索后端可插拔：已支持 `duckduckgo`、`bing_cn`、`searxng` 和 `mojeek`，默认按 `duckduckgo -> bing_cn` 降级；SearXNG JSON 不可用时可降级读取 HTML 结果页。
+- 可选并发聚合：开启 `search_parallel_enabled` 后，可并发请求前几个可用搜索后端，按 URL 去重合并，并标注 `source_backends`。
 - `research_brief` 提效：支持同域名去重、并发抓取、失败来源保留错误信息。
 - `research_brief` URL 过滤：搜索结果进入抓取前会过滤非法 URL，并透传搜索后端的 `backend` 字段。
 - 反爬诊断：`fetch_url` 会对 `403/429`、验证页、登录页、JS 依赖页和已知强反爬域名超时返回结构化 `fetch_diagnostics`，`research_brief` 会透传失败来源的诊断信息。

@@ -947,6 +947,58 @@ def test_search_web_all_provider_failure_guides_model_away_from_immediate_retry(
     assert result["attempted_backends"][1]["backend"] == "bing_cn"
 
 
+def test_search_web_parallel_aggregates_and_deduplicates_backends(monkeypatch):
+    class Config:
+        search_provider = "duckduckgo"
+        search_providers = ("duckduckgo", "bing", "bing_cn")
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+        search_parallel_enabled = True
+        search_parallel_max_backends = 2
+
+    calls = []
+    started = set()
+    release = asyncio.Event()
+
+    async def fake_search_with_provider(provider, query, max_results, region, language, config):
+        calls.append(provider)
+        started.add(provider)
+        if len(started) == 2:
+            release.set()
+        await asyncio.wait_for(release.wait(), timeout=1)
+        if provider == "duckduckgo":
+            return "duckduckgo_html", [
+                {"title": "Shared DDG", "url": "https://example.com/shared", "snippet": "short"},
+                {"title": "Duck Only", "url": "https://example.com/duck", "snippet": "duck result"},
+            ]
+        if provider == "bing":
+            return "bing", [
+                {"title": "Shared Bing", "url": "https://example.com/shared", "snippet": "longer shared snippet"},
+                {"title": "Bing Only", "url": "https://example.com/bing", "snippet": "bing result"},
+            ]
+        raise AssertionError(f"unexpected provider: {provider}")
+
+    monkeypatch.setattr(web, "_search_with_provider", fake_search_with_provider)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=3, config=Config()))
+
+    assert calls == ["duckduckgo", "bing"]
+    assert result["backend"] == "parallel:duckduckgo_html+bing"
+    assert result["aggregation"] == {"mode": "parallel", "successful_backends": ["duckduckgo_html", "bing"]}
+    assert [item["url"] for item in result["results"]] == [
+        "https://example.com/shared",
+        "https://example.com/duck",
+        "https://example.com/bing",
+    ]
+    assert result["results"][0]["title"] == "Shared Bing"
+    assert result["results"][0]["snippet"] == "longer shared snippet"
+    assert result["results"][0]["source_backends"] == ["duckduckgo_html", "bing"]
+    assert result["attempted_backends"] == [{"backend": "duckduckgo_html", "ok": True}, {"backend": "bing", "ok": True}]
+
+
 def test_load_config_keeps_ordered_search_providers(tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text(
@@ -963,6 +1015,26 @@ def test_load_config_keeps_ordered_search_providers(tmp_path):
 
     assert config.search_provider == "duckduckgo"
     assert config.search_providers == ("duckduckgo", "bing_cn")
+
+
+def test_load_config_reads_parallel_search_options(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        """
+        {
+          "search_providers": ["duckduckgo", "bing", "bing_cn"],
+          "search_parallel_enabled": true,
+          "search_parallel_max_backends": 4
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    config = web.load_config(config_path)
+
+    assert config.search_parallel_enabled is True
+    assert config.search_parallel_max_backends == 4
+    assert web.config_to_dict(config)["search_parallel_enabled"] is True
 
 
 def test_load_config_accepts_utf8_bom_config(tmp_path):

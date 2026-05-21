@@ -24,6 +24,8 @@
 
 自定义后端会自动尝试常见 JSON 路径和字段名，也会在 `health_check` 中返回 `raw_result_count`、`usable_result_count`、命中的字段路径和业务错误信息。手动接 API 时，可以用 `cc-web-mcp config test-search custom:<name> "query"` 在命令行里先验证配置，再交给 Claude Code 实机调用。
 
+如果开启 `search_parallel_enabled`，`web_search` 会并发请求前几个可用后端并去重合并结果，返回 `backend: "parallel:..."`、`aggregation.successful_backends`，并在重复命中的结果项里标注 `source_backends`。这个模式更接近 ddgs 的元搜索思路，适合网络不稳定但可以接受多发几个公开搜索请求的场景。
+
 `fetch_url` 的 fallback 与 `web_search` 不同：普通搜索链路只在前一个搜索后端失败或空结果时进入下一个后端；抓取链路则是 `direct fetch -> Jina Reader -> search fallback`。开启 `enable_fetch_search_fallback` 后，只有目标 URL 命中配置的域名且直接抓取/Jina 都失败时，才会调用 `fetch_search_fallback_providers`。这适合把 `custom:zhihu` 放在普通搜索链路末尾，同时在抓取知乎正文失败时再定向使用知乎 API。
 
 ## 上下文友好的失败提示和分页

@@ -318,6 +318,8 @@ class GlobalWebConfig:
     cache_ttl_seconds: int = 1_800
     search_cache_ttl_seconds: int = 300
     search_backend_cooldown_seconds: int = 60
+    search_parallel_enabled: bool = False
+    search_parallel_max_backends: int = 2
     trust_tun_fake_ip_dns: bool = False
     cache_dir: str = str(DEFAULT_CACHE_DIR)
     trusted_proxy_domains: tuple[str, ...] = ()
@@ -671,6 +673,8 @@ def load_config(path: str | Path | None = None) -> GlobalWebConfig:
         cache_ttl_seconds=_bounded_int(raw.get("cache_ttl_seconds"), 1_800, 0, 86_400),
         search_cache_ttl_seconds=_bounded_int(raw.get("search_cache_ttl_seconds"), 300, 0, 3_600),
         search_backend_cooldown_seconds=_bounded_int(raw.get("search_backend_cooldown_seconds"), 60, 0, 3_600),
+        search_parallel_enabled=bool(raw.get("search_parallel_enabled", False)),
+        search_parallel_max_backends=_bounded_int(raw.get("search_parallel_max_backends"), 2, 1, 5),
         trust_tun_fake_ip_dns=bool(raw.get("trust_tun_fake_ip_dns", False)),
         cache_dir=str(raw.get("cache_dir") or DEFAULT_CACHE_DIR),
         trusted_proxy_domains=_normalize_string_tuple(raw.get("trusted_proxy_domains")),
@@ -706,6 +710,8 @@ def config_to_dict(config: GlobalWebConfig) -> dict[str, Any]:
         "cache_ttl_seconds": config.cache_ttl_seconds,
         "search_cache_ttl_seconds": config.search_cache_ttl_seconds,
         "search_backend_cooldown_seconds": config.search_backend_cooldown_seconds,
+        "search_parallel_enabled": config.search_parallel_enabled,
+        "search_parallel_max_backends": config.search_parallel_max_backends,
         "trust_tun_fake_ip_dns": config.trust_tun_fake_ip_dns,
         "cache_dir": config.cache_dir,
         "trusted_proxy_domains": list(config.trusted_proxy_domains),
@@ -2178,6 +2184,96 @@ def _non_fallback_search_providers(config: Any, fallback_providers: tuple[str, .
     return tuple(provider for provider in DEFAULT_SEARCH_PROVIDERS if provider not in fallback_set)
 
 
+def _search_result_key(result: dict[str, Any]) -> str:
+    url = str(result.get("url") or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    return urlunparse((parsed.scheme.lower(), (parsed.netloc or "").lower(), parsed.path or "/", "", parsed.query, ""))
+
+
+def _merge_parallel_search_results(
+    successful_results: list[tuple[str, list[dict[str, Any]]]],
+) -> list[dict[str, Any]]:
+    merged: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    for backend, results in successful_results:
+        for result in results:
+            key = _search_result_key(result)
+            if not key:
+                continue
+            source_backends = [backend]
+            candidate = dict(result)
+            candidate["source_backends"] = source_backends
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = candidate
+                continue
+
+            existing_backends = existing.setdefault("source_backends", [])
+            if backend not in existing_backends:
+                existing_backends.append(backend)
+            existing_snippet = str(existing.get("snippet") or "")
+            candidate_snippet = str(candidate.get("snippet") or "")
+            if len(candidate_snippet) > len(existing_snippet):
+                candidate["source_backends"] = existing_backends
+                merged[key] = candidate
+    return list(merged.values())
+
+
+def _parallel_search_backend_name(successful_backends: list[str]) -> str:
+    if not successful_backends:
+        return "parallel"
+    return "parallel:" + "+".join(successful_backends)
+
+
+def _parallel_search_candidate_providers(
+    providers: tuple[str, ...],
+    config: GlobalWebConfig | Any,
+) -> tuple[list[str], list[dict[str, Any]], str]:
+    max_backends = _bounded_int(_cfg(config, "search_parallel_max_backends", 2), 2, 1, 5)
+    candidates: list[str] = []
+    attempted_backends: list[dict[str, Any]] = []
+    fallback_reason = ""
+    for provider in providers:
+        backend = _provider_backend_name(provider)
+        if (
+            _custom_search_api_name(provider)
+            and not _cfg(config, "force_search_provider", False)
+            and not _custom_search_general_enabled(config, provider)
+        ):
+            attempted_backends.append(
+                {
+                    "backend": backend,
+                    "ok": False,
+                    "skipped": True,
+                    "error": "general_search_disabled",
+                }
+            )
+            if not fallback_reason:
+                fallback_reason = f"{backend} skipped: general_search_disabled"
+            continue
+
+        cooldown = _search_backend_cooldown_status(backend)
+        if cooldown:
+            attempted_backends.append(
+                {
+                    "backend": backend,
+                    "ok": False,
+                    "skipped": True,
+                    "error": f"cooldown: {cooldown['reason']}",
+                    "retry_after_seconds": cooldown["retry_after_seconds"],
+                }
+            )
+            if not fallback_reason:
+                fallback_reason = f"{backend} skipped: cooldown {cooldown['retry_after_seconds']}s remaining"
+            continue
+
+        candidates.append(provider)
+        if len(candidates) >= max_backends:
+            break
+    return candidates, attempted_backends, fallback_reason
+
+
 def _search_result_to_surrogate_markdown(result: dict[str, Any]) -> str:
     title = _clean_text(str(result.get("title") or "Search fallback result"))
     url = str(result.get("url") or "").strip()
@@ -2201,6 +2297,130 @@ def _search_result_to_surrogate_markdown(result: dict[str, Any]) -> str:
     if snippet:
         parts.append(snippet)
     return "\n\n".join(parts)
+
+
+async def _search_web_parallel(
+    query: str,
+    provider_query: str,
+    providers: tuple[str, ...],
+    max_results: int,
+    provider_result_limit: int,
+    region: str,
+    language: str,
+    normalized_domains: tuple[str, ...],
+    config: GlobalWebConfig | Any,
+    status: StatusRecorder,
+) -> dict[str, Any] | None:
+    candidate_providers, attempted_backends, fallback_reason = _parallel_search_candidate_providers(providers, config)
+    if len(candidate_providers) < 2:
+        return None
+
+    await status.add(
+        "cc-web: parallel search "
+        + ", ".join(_provider_backend_name(provider) for provider in candidate_providers)
+        + f" for {query}"
+    )
+
+    async def run_provider(provider: str) -> tuple[str, str, list[dict[str, Any]] | None, Exception | None]:
+        backend = _provider_backend_name(provider)
+        try:
+            backend, results = await _search_with_provider(
+                provider,
+                provider_query,
+                provider_result_limit,
+                region,
+                language,
+                config,
+            )
+            return provider, backend, results, None
+        except Exception as exc:  # noqa: BLE001
+            return provider, backend, None, exc
+
+    provider_results = await asyncio.gather(*(run_provider(provider) for provider in candidate_providers))
+    successful_results: list[tuple[str, list[dict[str, Any]]]] = []
+    successful_backends: list[str] = []
+    last_error = ""
+    for _provider, backend, results, exc in provider_results:
+        if exc is not None:
+            last_error = f"{type(exc).__name__}: {exc}"
+            attempted = {"backend": backend, "ok": False, "error": last_error}
+            cooldown_seconds = _record_search_backend_failure(backend, exc, config)
+            if cooldown_seconds:
+                attempted["cooldown_seconds"] = cooldown_seconds
+            attempted_backends.append(attempted)
+            if not fallback_reason:
+                fallback_reason = f"{backend} failed: {last_error}"
+            continue
+        _clear_search_backend_cooldown(backend)
+        attempted_backends.append({"backend": backend, "ok": True})
+        successful_backends.append(backend)
+        successful_results.append((backend, list(results or [])))
+
+    if not successful_results:
+        return {
+            "ok": False,
+            "query": query,
+            "backend": _parallel_search_backend_name(successful_backends),
+            "status_summary": "search failed: all parallel search backends failed",
+            "steps": status.steps,
+            "fetched_at": now_iso(),
+            "error": last_error or "all parallel search providers failed",
+            "fallback_reason": fallback_reason,
+            "attempted_backends": attempted_backends,
+            "retryable": True,
+            "retry_after_seconds": 30,
+            "do_not_retry_reason": "All configured search backends failed; do not repeat the same search immediately.",
+            "recommended_next_action": "Run health_check to inspect search backends, retry later, or change search_providers.",
+            "results": [],
+        }
+
+    results = _merge_parallel_search_results(successful_results)
+    raw_result_count = len(results[:provider_result_limit])
+    if _cfg(config, "prefer_technical_sources", True):
+        results = rank_search_results(results)
+    removed_by_domain = 0
+    if normalized_domains:
+        results, removed_by_domain = filter_search_results_by_domains(results, normalized_domains)
+    usable_result_count = len(results[:max_results])
+    backend = _parallel_search_backend_name(successful_backends)
+    await status.add(f"cc-web: {backend} returned {usable_result_count} usable results")
+
+    response: dict[str, Any] = {
+        "ok": True,
+        "query": query,
+        "backend": backend,
+        "status_summary": f"search complete: {usable_result_count} results from {backend}",
+        "steps": status.steps,
+        "fetched_at": now_iso(),
+        "results": results[:max_results],
+        "attempted_backends": attempted_backends,
+        "aggregation": {
+            "mode": "parallel",
+            "successful_backends": successful_backends,
+        },
+    }
+    if normalized_domains:
+        response["domain_filter"] = {
+            "domains": list(normalized_domains),
+            "removed_results": removed_by_domain,
+        }
+    if "bing_cn" in successful_backends:
+        response["search_scope_note"] = BING_CN_SCOPE_NOTE
+    if fallback_reason:
+        response["fallback_reason"] = fallback_reason
+    if usable_result_count == 0:
+        response.update(
+            {
+                "ok": False,
+                "status_summary": "search failed: parallel search returned no usable results",
+                "error": f"empty_results_after_parallel_aggregation: raw={raw_result_count}, removed_by_domain={removed_by_domain}",
+                "retryable": True,
+                "retry_after_seconds": 30,
+                "do_not_retry_reason": "Parallel search returned no usable results; do not repeat the same search immediately.",
+                "recommended_next_action": "Try a broader query, remove domain filters, or run health_check.",
+            }
+        )
+    return response
 
 
 def _exact_search_result(candidates: list[dict[str, Any]], safe_url: str) -> dict[str, Any] | None:
@@ -2372,6 +2592,25 @@ async def search_web(
     attempted_backends: list[dict[str, Any]] = []
     fallback_reason = ""
     last_error = ""
+
+    if _cfg(config, "search_parallel_enabled", False):
+        parallel_response = await _search_web_parallel(
+            query,
+            provider_query,
+            providers,
+            max_results,
+            provider_result_limit,
+            region,
+            language,
+            normalized_domains,
+            config,
+            status,
+        )
+        if parallel_response is not None:
+            if parallel_response.get("ok") and _cfg(config, "search_cache_ttl_seconds", 0) > 0:
+                parallel_response["cache"] = "miss"
+                _write_search_cache(config, search_cache_key, parallel_response)
+            return _attach_search_ref_ids(parallel_response)
 
     for provider_index, provider in enumerate(providers):
         backend = _provider_backend_name(provider)

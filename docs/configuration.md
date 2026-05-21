@@ -40,6 +40,8 @@ cc-web-mcp config init
   "cache_ttl_seconds": 1800,
   "search_cache_ttl_seconds": 300,
   "search_backend_cooldown_seconds": 60,
+  "search_parallel_enabled": false,
+  "search_parallel_max_backends": 2,
   "trust_tun_fake_ip_dns": false,
   "trusted_proxy_domains": [],
   "enable_pdf_extract": false
@@ -234,6 +236,27 @@ direct fetch -> Jina Reader fallback -> search fallback
 ```
 
 该选项只放行“公开域名解析到 `198.18.0.0/15`”的情况；直接访问 `198.18.x.x`、`127.0.0.1`、内网地址和云 metadata 地址仍会被拦截。
+
+## 并发搜索聚合
+
+默认搜索模式是顺序 fallback：先尝试 `search_providers` 里的第一个后端，失败或空结果时再尝试下一个。这个模式最省请求，也最容易解释。
+
+如果你希望更接近元搜索行为，可以打开并发聚合：
+
+```json
+{
+  "search_parallel_enabled": true,
+  "search_parallel_max_backends": 2
+}
+```
+
+开启后，`web_search` 会并发请求当前可用的前几个搜索后端，跳过处于冷却中的后端和禁用普通搜索的 `custom:<name>` 后端，然后按 URL 去重合并结果。重复 URL 会保留更长的摘要，并在结果项里增加 `source_backends`，表示该结果来自哪些后端。返回顶层会增加：
+
+- `backend`：例如 `parallel:duckduckgo_html+bing`。
+- `aggregation`：包含 `mode: "parallel"` 和 `successful_backends`。
+- `attempted_backends`：仍保留每个后端的成功、失败或跳过状态。
+
+建议先设为 `2`，通常让 DuckDuckGo 和国际版 Bing 并发已经能提升稳定性；把 `bing_cn` 也纳入并发可能带来区域偏置结果。
 
 ## PDF 提取
 
