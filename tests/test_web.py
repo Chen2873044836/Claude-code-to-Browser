@@ -511,6 +511,108 @@ def test_search_web_uses_international_bing_provider(monkeypatch):
     assert result["results"][0]["url"] == "https://example.com/international"
 
 
+def test_search_web_falls_back_when_bing_returns_challenge(monkeypatch):
+    class Config:
+        search_provider = "bing"
+        search_providers = ("bing", "bing_cn")
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            calls.append(url)
+            if url == "https://www.bing.com/search":
+                return httpx.Response(
+                    200,
+                    text="""
+                    <html><body>
+                      <form id="b_captchaform" action="/turing/captcha/challenge"></form>
+                      <title>Microsoft Bing - Are you a human?</title>
+                    </body></html>
+                    """,
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <li class="b_algo">
+                    <h2><a href="https://example.com/bing-cn">Bing CN</a></h2>
+                    <div class="b_caption"><p>fallback result.</p></div>
+                  </li>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=2, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "bing_cn"
+    assert calls == ["https://www.bing.com/search", "https://cn.bing.com/search"]
+    assert result["attempted_backends"][0]["backend"] == "bing"
+    assert result["attempted_backends"][0]["ok"] is False
+    assert "bing_challenge" in result["attempted_backends"][0]["error"]
+
+
+def test_search_web_reports_bing_challenge_when_no_fallback(monkeypatch):
+    class Config:
+        search_provider = "bing_cn"
+        search_providers = ("bing_cn",)
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <div id="b_tween">One last step</div>
+                  <form action="/turing/captcha/challenge"></form>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=2, config=Config()))
+
+    assert result["ok"] is False
+    assert result["attempted_backends"][0]["backend"] == "bing_cn"
+    assert "bing_challenge" in result["attempted_backends"][0]["error"]
+    assert "captcha" in result["attempted_backends"][0]["error"]
+
+
 def test_search_web_default_chain_prefers_international_bing_before_bing_cn(monkeypatch):
     class Config:
         search_provider = "duckduckgo"

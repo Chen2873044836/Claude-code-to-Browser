@@ -1205,6 +1205,27 @@ def _duckduckgo_challenge_reason(status_code: int, html: str) -> str:
     return ""
 
 
+def _bing_challenge_reason(status_code: int, html: str) -> str:
+    text = (html or "").lower()
+    signals: list[str] = []
+    if status_code in {403, 429}:
+        signals.append(f"status={status_code}")
+    for marker in (
+        "b_captchaform",
+        "/turing/captcha",
+        "are you a human",
+        "one last step",
+        "unusual traffic",
+        "verify you are",
+        "captcha",
+    ):
+        if marker in text:
+            signals.append(marker)
+    if signals:
+        return "bing_challenge: " + ", ".join(signals)
+    return ""
+
+
 def normalize_searxng_results(payload: dict[str, Any], max_results: int = 5) -> list[dict[str, str]]:
     results: list[dict[str, Any]] = []
     for item in payload.get("results", []):
@@ -1695,6 +1716,9 @@ async def _search_with_provider(
                 params={"q": query, "mkt": "zh-CN", "setlang": language or "zh-cn"},
                 follow_redirects=True,
             )
+            challenge_reason = _bing_challenge_reason(response.status_code, response.text)
+            if challenge_reason:
+                raise SearchBackendUnavailableError(challenge_reason)
             response.raise_for_status()
             return "bing", normalize_bing_results(response.text, max_results=max_results)
 
@@ -1709,6 +1733,9 @@ async def _search_with_provider(
                 params={"q": query, "ensearch": "1", "cc": "cn", "setlang": language or "zh-cn"},
                 follow_redirects=True,
             )
+            challenge_reason = _bing_challenge_reason(response.status_code, response.text)
+            if challenge_reason:
+                raise SearchBackendUnavailableError(challenge_reason)
             response.raise_for_status()
             return "bing_cn", normalize_bing_cn_results(response.text, max_results=max_results)
 
@@ -2747,7 +2774,7 @@ async def search_web(
                 results, removed_by_domain = filter_search_results_by_domains(results, normalized_domains)
             usable_result_count = len(results[:max_results])
             await status.add(f"cc-web: {backend} returned {usable_result_count} usable results")
-            if usable_result_count == 0 and provider_index < len(providers) - 1:
+            if usable_result_count == 0:
                 reason = "empty_results"
                 if normalized_domains and removed_by_domain:
                     reason = f"empty_results_after_domain_filter: raw={raw_result_count}, removed={removed_by_domain}"
