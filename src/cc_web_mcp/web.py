@@ -7,11 +7,12 @@ import hashlib
 import inspect
 import ipaddress
 import json
+import os
 import re
 import socket
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -39,7 +40,38 @@ BROWSE_REF_TTL_SECONDS = 1_800
 MAX_BROWSE_REFS = 200
 BING_CN_SCOPE_NOTE = "bing_cn may be region-biased and is used as fallback; it is not equivalent to full global search."
 DEFAULT_SEARCH_PROVIDERS = ("duckduckgo", "bing", "bing_cn")
+CUSTOM_SEARCH_PROVIDER_PREFIX = "custom:"
 MAX_SEARCH_BACKEND_COOLDOWN_SECONDS = 300
+DEFAULT_CUSTOM_RESULTS_PATHS = (
+    "results",
+    "items",
+    "data.results",
+    "data.items",
+    "data",
+    "Data.Items",
+    "Data.Results",
+    "Data",
+    "web.results",
+    "organic_results",
+)
+DEFAULT_CUSTOM_TITLE_PATHS = ("title", "Title", "name", "Name", "headline", "Headline", "object.title")
+DEFAULT_CUSTOM_URL_PATHS = ("url", "Url", "URL", "link", "Link", "href", "Href", "object.url", "target.url")
+DEFAULT_CUSTOM_SNIPPET_PATHS = (
+    "snippet",
+    "Snippet",
+    "description",
+    "Description",
+    "summary",
+    "Summary",
+    "content",
+    "Content",
+    "ContentText",
+    "excerpt",
+    "Excerpt",
+    "text",
+    "Text",
+    "object.excerpt",
+)
 _SEARCH_BACKEND_COOLDOWNS: dict[str, dict[str, Any]] = {}
 ANTI_BOT_DOMAINS = (
     "zhihu.com",
@@ -246,6 +278,16 @@ class BrowseSession:
             self._entries.move_to_end(entry.ref_id)
         return entry
 
+    def find_by_url(self, url: str | None) -> BrowseRef | None:
+        if not url:
+            return None
+        self._prune()
+        for entry in reversed(self._entries.values()):
+            if _result_matches_target_url(entry.url, str(url)):
+                self._entries.move_to_end(entry.ref_id)
+                return entry
+        return None
+
 
 _BROWSE_SESSION = BrowseSession()
 
@@ -255,6 +297,7 @@ class GlobalWebConfig:
     allowed_model_patterns: tuple[str, ...] = ("deepseek",)
     search_provider: str = "duckduckgo"
     search_providers: tuple[str, ...] = DEFAULT_SEARCH_PROVIDERS
+    custom_search_apis: dict[str, dict[str, Any]] | None = None
     allow_fetch_url_for_claude: bool = False
     block_native_web_for_allowed_models: bool = True
     searxng_base_url: str = ""
@@ -266,6 +309,11 @@ class GlobalWebConfig:
     brief_chars_per_source: int = 2_500
     enable_jina_fallback: bool = True
     jina_min_chars: int = 300
+    enable_fetch_search_fallback: bool = False
+    fetch_search_fallback_domains: tuple[str, ...] = ()
+    fetch_search_fallback_providers: tuple[str, ...] = ()
+    fetch_search_fallback_mode: str = "exact_or_candidates"
+    max_fetch_search_fallback_results: int = 3
     allow_private_networks: bool = False
     cache_ttl_seconds: int = 1_800
     search_cache_ttl_seconds: int = 300
@@ -319,6 +367,21 @@ def _normalize_search_providers(raw_providers: Any, default_provider: str = "duc
     return tuple(providers or DEFAULT_SEARCH_PROVIDERS)
 
 
+def _normalize_optional_search_providers(raw_providers: Any) -> tuple[str, ...]:
+    if isinstance(raw_providers, str):
+        items = [raw_providers]
+    elif isinstance(raw_providers, (list, tuple)):
+        items = list(raw_providers)
+    else:
+        items = []
+    providers: list[str] = []
+    for item in items:
+        provider = _normalize_search_provider_name(item)
+        if provider and provider not in providers:
+            providers.append(provider)
+    return tuple(providers)
+
+
 def _normalize_string_tuple(raw_items: Any) -> tuple[str, ...]:
     if isinstance(raw_items, str):
         items = [raw_items]
@@ -333,6 +396,170 @@ def _normalize_string_tuple(raw_items: Any) -> tuple[str, ...]:
         if value and value not in normalized:
             normalized.append(value)
     return tuple(normalized)
+
+
+def _expand_env_placeholders(value: Any) -> Any:
+    if isinstance(value, str):
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda match: os.environ.get(match.group(1), ""), value)
+    if isinstance(value, list):
+        return [_expand_env_placeholders(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _expand_env_placeholders(item) for key, item in value.items()}
+    return value
+
+
+def _normalize_custom_search_apis(raw_apis: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw_apis, dict):
+        return {}
+
+    apis: dict[str, dict[str, Any]] = {}
+    for raw_name, raw_spec in raw_apis.items():
+        name = str(raw_name or "").strip().lower().replace("-", "_")
+        if not name or not isinstance(raw_spec, dict):
+            continue
+        spec = _expand_env_placeholders(raw_spec)
+        if isinstance(spec, dict):
+            apis[name] = spec
+    return apis
+
+
+def _redact_custom_search_apis(apis: dict[str, dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
+    sensitive_keys = {"api_key", "apikey", "token", "access_token", "secret", "password", "authorization", "auth"}
+    redacted: dict[str, dict[str, Any]] = {}
+    for name, spec in (apis or {}).items():
+        safe_spec = dict(spec)
+        if isinstance(safe_spec.get("headers"), dict):
+            safe_spec["headers"] = {str(key): "***" for key in safe_spec["headers"]}
+        for container_name in ("params", "json"):
+            container = safe_spec.get(container_name)
+            if not isinstance(container, dict):
+                continue
+            safe_container = dict(container)
+            for key in list(safe_container):
+                normalized_key = str(key).lower().replace("-", "_")
+                if normalized_key in sensitive_keys or normalized_key.endswith("_token") or normalized_key.endswith("_secret"):
+                    safe_container[key] = "***"
+            safe_spec[container_name] = safe_container
+        redacted[name] = safe_spec
+    return redacted
+
+
+def _custom_search_api_name(provider: str) -> str | None:
+    normalized = _normalize_search_provider_name(provider)
+    if not normalized.startswith(CUSTOM_SEARCH_PROVIDER_PREFIX):
+        return None
+    name = normalized[len(CUSTOM_SEARCH_PROVIDER_PREFIX) :].strip().lower().replace("-", "_")
+    return name or None
+
+
+def _custom_search_api_spec(config: Any, provider: str) -> dict[str, Any] | None:
+    custom_name = _custom_search_api_name(provider)
+    if not custom_name:
+        return None
+    spec = (_cfg(config, "custom_search_apis", {}) or {}).get(custom_name)
+    return spec if isinstance(spec, dict) else None
+
+
+def _custom_search_general_enabled(config: Any, provider: str) -> bool:
+    spec = _custom_search_api_spec(config, provider)
+    if spec is None:
+        return True
+    return bool(spec.get("enable_general_search", True))
+
+
+def _render_search_api_template(value: Any, context: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        rendered = value
+        for key, replacement in context.items():
+            rendered = rendered.replace("{" + key + "}", replacement)
+        return rendered
+    if isinstance(value, list):
+        return [_render_search_api_template(item, context) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _render_search_api_template(item, context) for key, item in value.items()}
+    return value
+
+
+def _get_by_dot_path(data: Any, path: Any, default: Any = None) -> Any:
+    if not path:
+        return data
+    current = data
+    for part in str(path).split("."):
+        if isinstance(current, dict):
+            current = current.get(part, default)
+        elif isinstance(current, list) and part.isdigit():
+            index = int(part)
+            current = current[index] if 0 <= index < len(current) else default
+        else:
+            return default
+        if current is default:
+            return default
+    return current
+
+
+def _get_by_dot_path_candidates(data: Any, paths: Any, default: Any = None) -> Any:
+    value, _matched_path = _get_by_dot_path_candidates_with_path(data, paths, default)
+    return value
+
+
+def _get_by_dot_path_candidates_with_path(data: Any, paths: Any, default: Any = None) -> tuple[Any, str]:
+    if isinstance(paths, (list, tuple)):
+        for path in paths:
+            value = _get_by_dot_path(data, path, default)
+            if value is not default and value not in (None, ""):
+                return value, str(path)
+        return default, ""
+    value = _get_by_dot_path(data, paths, default)
+    if value is default or value in (None, ""):
+        return default, ""
+    return value, str(paths or "")
+
+
+def _custom_path_candidates(spec: dict[str, Any], key: str, defaults: tuple[str, ...]) -> Any:
+    configured = spec.get(key)
+    if configured:
+        return configured
+    return defaults
+
+
+def _path_hint(paths: Any) -> str:
+    if isinstance(paths, (list, tuple)):
+        return "|".join(str(path) for path in paths)
+    return str(paths or "")
+
+
+def _coerce_custom_result_items(raw_results: Any) -> list[Any]:
+    if isinstance(raw_results, list):
+        return raw_results
+    if not isinstance(raw_results, dict):
+        return []
+    for key in ("Items", "items", "Results", "results", "Data", "data", "organic_results"):
+        value = raw_results.get(key)
+        items = _coerce_custom_result_items(value)
+        if items:
+            return items
+    return []
+
+
+def _custom_result_metadata(item: dict[str, Any], spec: dict[str, Any]) -> dict[str, Any]:
+    extra_paths = spec.get("extra_paths")
+    if not isinstance(extra_paths, dict):
+        return {}
+    metadata: dict[str, Any] = {}
+    for raw_key, raw_path in extra_paths.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        value = _get_by_dot_path_candidates(item, raw_path)
+        if value in (None, ""):
+            continue
+        metadata[key] = value
+    return metadata
+
+
+def _metadata_label(key: str) -> str:
+    label = str(key or "").replace("_", " ").replace("-", " ").strip()
+    return label.title() if label else "Metadata"
 
 
 def _normalize_domains(raw_domains: Any) -> tuple[str, ...]:
@@ -397,7 +624,7 @@ def load_config(path: str | Path | None = None) -> GlobalWebConfig:
         raw = {}
     try:
         if config_path.exists():
-            user_raw = json.loads(config_path.read_text(encoding="utf-8"))
+            user_raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
             if isinstance(user_raw, dict):
                 raw.update(user_raw)
     except Exception:
@@ -417,11 +644,13 @@ def load_config(path: str | Path | None = None) -> GlobalWebConfig:
         if legacy_search_provider
         else (search_providers[0] if search_providers else "duckduckgo")
     )
+    custom_search_apis = _normalize_custom_search_apis(raw.get("custom_search_apis"))
 
     return GlobalWebConfig(
         allowed_model_patterns=allowed_model_patterns,
         search_provider=search_provider,
         search_providers=search_providers,
+        custom_search_apis=custom_search_apis,
         allow_fetch_url_for_claude=bool(raw.get("allow_fetch_url_for_claude", False)),
         block_native_web_for_allowed_models=bool(raw.get("block_native_web_for_allowed_models", True)),
         searxng_base_url=str(raw.get("searxng_base_url") or "").strip().rstrip("/"),
@@ -433,6 +662,11 @@ def load_config(path: str | Path | None = None) -> GlobalWebConfig:
         brief_chars_per_source=_bounded_int(raw.get("brief_chars_per_source"), 2_500, 100, 20_000),
         enable_jina_fallback=bool(raw.get("enable_jina_fallback", True)),
         jina_min_chars=_bounded_int(raw.get("jina_min_chars"), 300, 0, 5_000),
+        enable_fetch_search_fallback=bool(raw.get("enable_fetch_search_fallback", False)),
+        fetch_search_fallback_domains=_normalize_domains(raw.get("fetch_search_fallback_domains")),
+        fetch_search_fallback_providers=_normalize_optional_search_providers(raw.get("fetch_search_fallback_providers")),
+        fetch_search_fallback_mode=str(raw.get("fetch_search_fallback_mode") or "exact_or_candidates").strip().lower(),
+        max_fetch_search_fallback_results=_bounded_int(raw.get("max_fetch_search_fallback_results"), 3, 1, 10),
         allow_private_networks=bool(raw.get("allow_private_networks", False)),
         cache_ttl_seconds=_bounded_int(raw.get("cache_ttl_seconds"), 1_800, 0, 86_400),
         search_cache_ttl_seconds=_bounded_int(raw.get("search_cache_ttl_seconds"), 300, 0, 3_600),
@@ -451,6 +685,7 @@ def config_to_dict(config: GlobalWebConfig) -> dict[str, Any]:
         "allowed_model_patterns": list(config.allowed_model_patterns),
         "search_provider": config.search_provider,
         "search_providers": list(config.search_providers),
+        "custom_search_apis": _redact_custom_search_apis(config.custom_search_apis),
         "allow_fetch_url_for_claude": config.allow_fetch_url_for_claude,
         "block_native_web_for_allowed_models": config.block_native_web_for_allowed_models,
         "searxng_base_url": config.searxng_base_url,
@@ -462,6 +697,11 @@ def config_to_dict(config: GlobalWebConfig) -> dict[str, Any]:
         "brief_chars_per_source": config.brief_chars_per_source,
         "enable_jina_fallback": config.enable_jina_fallback,
         "jina_min_chars": config.jina_min_chars,
+        "enable_fetch_search_fallback": config.enable_fetch_search_fallback,
+        "fetch_search_fallback_domains": list(config.fetch_search_fallback_domains),
+        "fetch_search_fallback_providers": list(config.fetch_search_fallback_providers),
+        "fetch_search_fallback_mode": config.fetch_search_fallback_mode,
+        "max_fetch_search_fallback_results": config.max_fetch_search_fallback_results,
         "allow_private_networks": config.allow_private_networks,
         "cache_ttl_seconds": config.cache_ttl_seconds,
         "search_cache_ttl_seconds": config.search_cache_ttl_seconds,
@@ -909,7 +1149,7 @@ def _duckduckgo_challenge_reason(status_code: int, html: str) -> str:
 
 
 def normalize_searxng_results(payload: dict[str, Any], max_results: int = 5) -> list[dict[str, str]]:
-    results: list[SearchResult] = []
+    results: list[dict[str, Any]] = []
     for item in payload.get("results", []):
         title = _clean_text(str(item.get("title") or ""))
         url = str(item.get("url") or "").strip()
@@ -945,6 +1185,110 @@ def normalize_searxng_html_results(html: str, max_results: int = 5) -> list[dict
             break
 
     return [result.__dict__ for result in results]
+
+
+def normalize_custom_search_api_results(
+    payload: Any,
+    spec: dict[str, Any],
+    max_results: int = 5,
+) -> list[dict[str, str]]:
+    results, _diagnostics = normalize_custom_search_api_results_with_diagnostics(payload, spec, max_results=max_results)
+    return results
+
+
+def normalize_custom_search_api_results_with_diagnostics(
+    payload: Any,
+    spec: dict[str, Any],
+    max_results: int = 5,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    results_path = _custom_path_candidates(spec, "results_path", DEFAULT_CUSTOM_RESULTS_PATHS)
+    raw_results, matched_results_path = _get_by_dot_path_candidates_with_path(payload, results_path, [])
+    raw_items = _coerce_custom_result_items(raw_results)
+
+    title_path = _custom_path_candidates(spec, "title_path", DEFAULT_CUSTOM_TITLE_PATHS)
+    url_path = _custom_path_candidates(spec, "url_path", DEFAULT_CUSTOM_URL_PATHS)
+    snippet_path = _custom_path_candidates(spec, "snippet_path", DEFAULT_CUSTOM_SNIPPET_PATHS)
+
+    results: list[dict[str, Any]] = []
+    missing_title = 0
+    missing_url = 0
+    matched_title_path = ""
+    matched_url_path = ""
+    matched_snippet_path = ""
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        raw_title, current_title_path = _get_by_dot_path_candidates_with_path(item, title_path, "")
+        raw_url, current_url_path = _get_by_dot_path_candidates_with_path(item, url_path, "")
+        raw_snippet, current_snippet_path = _get_by_dot_path_candidates_with_path(item, snippet_path, "")
+        title = _clean_text(str(raw_title or ""))
+        url = str(raw_url or "").strip()
+        snippet = _clean_text(str(raw_snippet or ""))
+        if current_title_path and not matched_title_path:
+            matched_title_path = current_title_path
+        if current_url_path and not matched_url_path:
+            matched_url_path = current_url_path
+        if current_snippet_path and not matched_snippet_path:
+            matched_snippet_path = current_snippet_path
+        if not title:
+            missing_title += 1
+        if not url:
+            missing_url += 1
+        if not title or not url:
+            continue
+        result: dict[str, Any] = {"title": title, "url": url, "snippet": snippet}
+        metadata = _custom_result_metadata(item, spec)
+        if metadata:
+            result["metadata"] = metadata
+        results.append(result)
+        if len(results) >= max_results:
+            break
+
+    diagnostics = {
+        "results_path": matched_results_path or _path_hint(results_path),
+        "title_path": matched_title_path or _path_hint(title_path),
+        "url_path": matched_url_path or _path_hint(url_path),
+        "snippet_path": matched_snippet_path or _path_hint(snippet_path),
+        "raw_result_count": len(raw_items),
+        "usable_result_count": len(results),
+        "missing_title": missing_title,
+        "missing_url": missing_url,
+    }
+    return results, diagnostics
+
+
+def _custom_search_empty_results_reason(diagnostics: dict[str, Any]) -> str:
+    parts = [
+        f"raw_result_count={diagnostics.get('raw_result_count', 0)}",
+        f"usable_result_count={diagnostics.get('usable_result_count', 0)}",
+    ]
+    for key in ("results_path", "title_path", "url_path", "snippet_path"):
+        value = diagnostics.get(key)
+        if value:
+            parts.append(f"{key}={value}")
+    for key in ("missing_title", "missing_url"):
+        value = int(diagnostics.get(key) or 0)
+        if value:
+            parts.append(f"{key}={value}")
+    return "custom api returned no usable results: " + ", ".join(parts)
+
+
+def _validate_custom_search_api_payload(payload: Any, spec: dict[str, Any]) -> None:
+    code_path = spec.get("success_code_path")
+    if not code_path:
+        return
+
+    actual_code = _get_by_dot_path_candidates(payload, code_path)
+    expected_codes = spec.get("success_codes", [0, 200])
+    if not isinstance(expected_codes, (list, tuple, set)):
+        expected_codes = [expected_codes]
+    normalized_expected = {str(code) for code in expected_codes}
+    if str(actual_code) in normalized_expected:
+        return
+
+    message = _get_by_dot_path_candidates(payload, spec.get("message_path", "message"), "")
+    detail = f": {message}" if message else ""
+    raise SearchBackendUnavailableError(f"custom api response code mismatch: {actual_code}{detail}")
 
 
 def normalize_mojeek_results(html: str, max_results: int = 5) -> list[dict[str, str]]:
@@ -1048,6 +1392,9 @@ def rank_search_results(results: list[dict[str, str]]) -> list[dict[str, str]]:
 
 def _provider_backend_name(provider: str) -> str:
     normalized = _normalize_search_provider_name(provider)
+    custom_name = _custom_search_api_name(normalized)
+    if custom_name:
+        return f"{CUSTOM_SEARCH_PROVIDER_PREFIX}{custom_name}"
     if normalized == "duckduckgo":
         return "duckduckgo_html"
     return normalized
@@ -1109,22 +1456,40 @@ def _search_backend_cooldown_report() -> dict[str, dict[str, Any]]:
     return report
 
 
-def _search_backend_health_request(provider: str, config: GlobalWebConfig | Any) -> tuple[str, str, dict[str, str]]:
-    """Return backend name, URL, and query params for a lightweight search probe."""
+def _search_backend_health_request(provider: str, config: GlobalWebConfig | Any) -> tuple[str, str, dict[str, str], dict[str, str]]:
+    """Return backend name, URL, query params, and headers for a lightweight search probe."""
     provider = _normalize_search_provider_name(provider)
+    custom_name = _custom_search_api_name(provider)
+    if custom_name:
+        spec = (_cfg(config, "custom_search_apis", {}) or {}).get(custom_name)
+        if not isinstance(spec, dict):
+            raise ValueError(f"custom search api not configured: {custom_name}")
+        context = {"query": "cc-web health", "max_results": "1", "language": "zh-cn", "region": "wt-wt"}
+        context["unix_timestamp"] = str(int(time.time()))
+        url = str(_render_search_api_template(spec.get("url", ""), context)).strip()
+        if not url:
+            raise ValueError(f"custom search api url is empty: {custom_name}")
+        params = _render_search_api_template(spec.get("params", {"q": "{query}"}), context)
+        headers = _render_search_api_template(spec.get("headers", {}), context)
+        return (
+            f"{CUSTOM_SEARCH_PROVIDER_PREFIX}{custom_name}",
+            url,
+            params if isinstance(params, dict) else {},
+            headers if isinstance(headers, dict) else {},
+        )
     if provider == "searxng":
         base_url = _cfg(config, "searxng_base_url", "").rstrip("/")
         if not base_url:
             raise ValueError("searxng_base_url 不能为空")
-        return provider, f"{base_url}/search", {"q": "cc-web health", "format": "json"}
+        return provider, f"{base_url}/search", {"q": "cc-web health", "format": "json"}, {}
     if provider == "bing":
-        return provider, "https://www.bing.com/search", {"q": "cc-web health", "mkt": "zh-CN", "setlang": "zh-cn"}
+        return provider, "https://www.bing.com/search", {"q": "cc-web health", "mkt": "zh-CN", "setlang": "zh-cn"}, {}
     if provider == "bing_cn":
-        return provider, "https://cn.bing.com/search", {"q": "cc-web health", "ensearch": "1", "cc": "cn", "setlang": "zh-cn"}
+        return provider, "https://cn.bing.com/search", {"q": "cc-web health", "ensearch": "1", "cc": "cn", "setlang": "zh-cn"}, {}
     if provider == "duckduckgo":
-        return provider, "https://html.duckduckgo.com/html/", {"q": "cc-web health", "kl": "wt-wt"}
+        return provider, "https://html.duckduckgo.com/html/", {"q": "cc-web health", "kl": "wt-wt"}, {}
     if provider == "mojeek":
-        return provider, "https://www.mojeek.com/search", {"q": "cc-web health"}
+        return provider, "https://www.mojeek.com/search", {"q": "cc-web health"}, {}
     raise ValueError(f"不支持的搜索后端: {provider}")
 
 
@@ -1137,6 +1502,51 @@ async def _search_with_provider(
     config: GlobalWebConfig | Any,
 ) -> tuple[str, list[dict[str, str]]]:
     provider = _normalize_search_provider_name(provider)
+    custom_name = _custom_search_api_name(provider)
+
+    if custom_name:
+        spec = (_cfg(config, "custom_search_apis", {}) or {}).get(custom_name)
+        if not isinstance(spec, dict):
+            raise ValueError(f"custom search api not configured: {custom_name}")
+        context = {
+            "query": query,
+            "max_results": str(max_results),
+            "language": language or "zh-cn",
+            "region": region or "wt-wt",
+            "unix_timestamp": str(int(time.time())),
+        }
+        url = str(_render_search_api_template(spec.get("url", ""), context)).strip()
+        if not url:
+            raise ValueError(f"custom search api url is empty: {custom_name}")
+        method = str(spec.get("method") or "GET").strip().upper()
+        headers = _render_search_api_template(spec.get("headers", {}), context)
+        params = _render_search_api_template(spec.get("params", {"q": "{query}"}), context)
+        json_body = _render_search_api_template(spec.get("json"), context) if "json" in spec else None
+        request_headers = {**_headers(), **(headers if isinstance(headers, dict) else {})}
+        async with httpx.AsyncClient(headers=request_headers, timeout=REQUEST_TIMEOUT, max_redirects=5) as client:
+            if method == "POST":
+                response = await client.post(
+                    url,
+                    params=params if isinstance(params, dict) else None,
+                    json=json_body,
+                    follow_redirects=True,
+                )
+            else:
+                response = await client.get(
+                    url,
+                    params=params if isinstance(params, dict) else None,
+                    follow_redirects=True,
+                )
+            response.raise_for_status()
+            payload = response.json()
+            _validate_custom_search_api_payload(payload, spec)
+            results, diagnostics = normalize_custom_search_api_results_with_diagnostics(payload, spec, max_results=max_results)
+            if not results:
+                raise EmptySearchResultsError(_custom_search_empty_results_reason(diagnostics))
+            return (
+                f"{CUSTOM_SEARCH_PROVIDER_PREFIX}{custom_name}",
+                results,
+            )
 
     if provider == "searxng":
         base_url = _cfg(config, "searxng_base_url", "").rstrip("/")
@@ -1720,6 +2130,194 @@ async def _resolve_fetch_input(
     return entry.url, candidate_ref_id
 
 
+def _canonical_url_for_match(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    hostname = (parsed.hostname or "").lower().strip(".")
+    path = parsed.path.rstrip("/") or "/"
+    return urlunparse((parsed.scheme.lower(), hostname, path, "", "", ""))
+
+
+def _result_matches_target_url(result_url: str, target_url: str) -> bool:
+    return bool(result_url and target_url and _canonical_url_for_match(result_url) == _canonical_url_for_match(target_url))
+
+
+def _fetch_search_fallback_allowed(url: str, config: Any) -> bool:
+    if not _cfg(config, "enable_fetch_search_fallback", False):
+        return False
+    domains = _normalize_domains(_cfg(config, "fetch_search_fallback_domains", ()))
+    if not domains:
+        return False
+    hostname = (urlparse(url).hostname or "").lower().strip(".")
+    return bool(hostname and _domain_matches(hostname, domains))
+
+
+def _config_with_search_providers(config: Any, providers: tuple[str, ...], force: bool = False) -> Any:
+    if isinstance(config, GlobalWebConfig) and not force:
+        return replace(config, search_provider=providers[0], search_providers=providers)
+
+    class SearchProviderConfigProxy:
+        search_provider = providers[0]
+        search_providers = providers
+        force_search_provider = force
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(config, name)
+
+    return SearchProviderConfigProxy()
+
+
+def _non_fallback_search_providers(config: Any, fallback_providers: tuple[str, ...]) -> tuple[str, ...]:
+    configured = _normalize_search_providers(
+        _cfg(config, "search_providers", None),
+        _cfg(config, "search_provider", "duckduckgo"),
+    )
+    fallback_set = set(fallback_providers)
+    providers = tuple(provider for provider in configured if provider not in fallback_set)
+    if providers:
+        return providers
+    return tuple(provider for provider in DEFAULT_SEARCH_PROVIDERS if provider not in fallback_set)
+
+
+def _search_result_to_surrogate_markdown(result: dict[str, Any]) -> str:
+    title = _clean_text(str(result.get("title") or "Search fallback result"))
+    url = str(result.get("url") or "").strip()
+    snippet = _clean_multiline(str(result.get("snippet") or ""))
+    parts = [f"# {title}"]
+    if url:
+        parts.append(f"Source: {url}")
+    metadata = result.get("metadata")
+    if isinstance(metadata, dict):
+        lines = []
+        for key, value in metadata.items():
+            if value in (None, ""):
+                continue
+            if isinstance(value, (dict, list)):
+                value_text = json.dumps(value, ensure_ascii=False)
+            else:
+                value_text = str(value)
+            lines.append(f"{_metadata_label(str(key))}: {_clean_text(value_text)}")
+        if lines:
+            parts.append("\n".join(lines))
+    if snippet:
+        parts.append(snippet)
+    return "\n\n".join(parts)
+
+
+def _exact_search_result(candidates: list[dict[str, Any]], safe_url: str) -> dict[str, Any] | None:
+    return next((result for result in candidates if _result_matches_target_url(str(result.get("url") or ""), safe_url)), None)
+
+
+async def _discover_fetch_search_query(
+    safe_url: str,
+    config: Any,
+    fallback_providers: tuple[str, ...],
+    max_results: int,
+    status: StatusRecorder,
+) -> tuple[str, dict[str, Any]] | None:
+    discovery_providers = _non_fallback_search_providers(config, fallback_providers)
+    if not discovery_providers:
+        return None
+    await status.add(f"cc-web: discovering fetch fallback title via {', '.join(discovery_providers)}")
+    discovery = await search_web(
+        safe_url,
+        max_results=max_results,
+        config=_config_with_search_providers(config, discovery_providers),
+    )
+    if not isinstance(discovery, dict) or not discovery.get("ok"):
+        return None
+    exact = _exact_search_result(discovery.get("results", []), safe_url)
+    if not exact:
+        return None
+    query = _clean_text(f"{exact.get('title', '')} {exact.get('snippet', '')}")
+    if not query or query == safe_url:
+        return None
+    return query, {
+        "backend": discovery.get("backend", _provider_backend_name(discovery_providers[0])),
+        "url": exact.get("url"),
+        "title": exact.get("title"),
+        "snippet": exact.get("snippet"),
+    }
+
+
+async def _try_fetch_search_fallback(
+    safe_url: str,
+    config: Any,
+    status: StatusRecorder,
+    search_query: str | None = None,
+) -> dict[str, Any] | None:
+    if not _fetch_search_fallback_allowed(safe_url, config):
+        return None
+    providers = _normalize_optional_search_providers(_cfg(config, "fetch_search_fallback_providers", ()))
+    if not providers:
+        return None
+
+    max_results = _bounded_int(_cfg(config, "max_fetch_search_fallback_results", 3), 3, 1, 10)
+    mode = str(_cfg(config, "fetch_search_fallback_mode", "exact_or_candidates") or "exact_or_candidates").strip().lower()
+    fallback_config = _config_with_search_providers(config, providers, force=True)
+    query = _clean_text(search_query or safe_url)
+    await status.add(f"cc-web: trying fetch search fallback via {', '.join(providers)}")
+    search = await search_web(
+        query,
+        max_results=max_results,
+        config=fallback_config,
+    )
+    candidates = search.get("results", []) if isinstance(search, dict) else []
+    search_fallback = {
+        "backend": search.get("backend", _provider_backend_name(providers[0])) if isinstance(search, dict) else _provider_backend_name(providers[0]),
+        "providers": list(providers),
+        "query": query,
+        "exact_url_match": False,
+        "candidates": candidates[:max_results],
+    }
+    if not isinstance(search, dict) or not search.get("ok"):
+        search_fallback["error"] = search.get("error", "search fallback failed") if isinstance(search, dict) else "search fallback failed"
+        return {"ok": False, "search_fallback": search_fallback}
+
+    exact = _exact_search_result(candidates, safe_url)
+    discovered_from: dict[str, Any] | None = None
+    if not exact and not search_query:
+        discovered = await _discover_fetch_search_query(safe_url, config, providers, max_results, status)
+        if discovered:
+            query, discovered_from = discovered
+            await status.add("cc-web: retrying fetch search fallback with discovered title")
+            search = await search_web(
+                query,
+                max_results=max_results,
+                config=fallback_config,
+            )
+            candidates = search.get("results", []) if isinstance(search, dict) else []
+            search_fallback.update(
+                {
+                    "backend": search.get("backend", _provider_backend_name(providers[0])) if isinstance(search, dict) else _provider_backend_name(providers[0]),
+                    "query": query,
+                    "candidates": candidates[:max_results],
+                    "discovered_from": discovered_from,
+                }
+            )
+            if not isinstance(search, dict) or not search.get("ok"):
+                search_fallback["error"] = search.get("error", "search fallback failed") if isinstance(search, dict) else "search fallback failed"
+                return {"ok": False, "search_fallback": search_fallback}
+            exact = _exact_search_result(candidates, safe_url)
+    if exact:
+        search_fallback["exact_url_match"] = True
+        search_fallback["matched_url"] = str(exact.get("url") or "")
+        search_fallback["matched_by"] = "url"
+        if discovered_from:
+            search_fallback["discovered_from"] = discovered_from
+        return {
+            "ok": True,
+            "backend": f"search_fallback:{search_fallback['backend']}",
+            "source_type": "search_result_surrogate",
+            "exact_url_match": True,
+            "matched_url": search_fallback["matched_url"],
+            "markdown_full": _search_result_to_surrogate_markdown(exact),
+            "search_fallback": search_fallback,
+        }
+    if mode == "exact_only":
+        search_fallback["candidates"] = []
+    return {"ok": False, "search_fallback": search_fallback}
+
+
 async def search_web(
     query: str,
     max_results: int = 5,
@@ -1777,6 +2375,23 @@ async def search_web(
 
     for provider_index, provider in enumerate(providers):
         backend = _provider_backend_name(provider)
+        if (
+            _custom_search_api_name(provider)
+            and not _cfg(config, "force_search_provider", False)
+            and not _custom_search_general_enabled(config, provider)
+        ):
+            attempted_backends.append(
+                {
+                    "backend": backend,
+                    "ok": False,
+                    "skipped": True,
+                    "error": "general_search_disabled",
+                }
+            )
+            await status.add(f"cc-web: skipping {backend}, general search disabled")
+            if not fallback_reason:
+                fallback_reason = f"{backend} skipped: general_search_disabled"
+            continue
         cooldown = _search_backend_cooldown_status(backend)
         if cooldown and provider_index < len(providers) - 1:
             attempted_backends.append(
@@ -1871,6 +2486,7 @@ async def fetch_page(
     start_index: int = 0,
     extract_mode: str = "auto",
     ref_id: str | None = None,
+    search_fallback_query: str | None = None,
     config: GlobalWebConfig | None = None,
     status_callback: StatusCallback | None = None,
 ) -> dict[str, Any]:
@@ -1887,6 +2503,11 @@ async def fetch_page(
         target_url, resolved_from_ref_id = await _resolve_fetch_input(url, ref_id, status)
     except KeyError as exc:
         return _ref_not_found_response(str(exc.args[0]), status)
+    ref_entry = _BROWSE_SESSION.get(resolved_from_ref_id) if resolved_from_ref_id else None
+    if not ref_entry:
+        ref_entry = _BROWSE_SESSION.find_by_url(target_url)
+    if not search_fallback_query and ref_entry:
+        search_fallback_query = _clean_text(f"{ref_entry.title} {ref_entry.snippet}")
 
     network_policy = await evaluate_network_policy_async(
         target_url,
@@ -2057,7 +2678,57 @@ async def fetch_page(
             result["resolved_from_ref_id"] = resolved_from_ref_id
         if diagnostics:
             result["fetch_diagnostics"] = diagnostics
-        result.update(_fetch_failure_guidance(error_type, diagnostics.get("recommendation") if diagnostics else None))
+        search_fallback = await _try_fetch_search_fallback(safe_url, config, status, search_query=search_fallback_query)
+        if search_fallback:
+            if search_fallback.get("ok"):
+                markdown_full = str(search_fallback.get("markdown_full") or "")
+                window = slice_text_window(markdown_full, max_chars=max_chars, start_index=start_index)
+                fallback_result = {
+                    "ok": True,
+                    "url": safe_url,
+                    "final_url": search_fallback.get("matched_url") or safe_url,
+                    "backend": search_fallback["backend"],
+                    "source_type": search_fallback.get("source_type", "search_result_surrogate"),
+                    "exact_url_match": bool(search_fallback.get("exact_url_match")),
+                    "matched_url": search_fallback.get("matched_url"),
+                    "status_summary": f"fetch fallback complete: {search_fallback['backend']}, {window['content_length']} chars",
+                    "steps": status.steps,
+                    "status_code": None,
+                    "content_type": "text/markdown",
+                    "fetched_at": now_iso(),
+                    "markdown": window["text"],
+                    "content_length": window["content_length"],
+                    "returned_range": window["returned_range"],
+                    "truncated": window["truncated"],
+                    "next_start_index": window["next_start_index"],
+                    "cache": "miss",
+                    "network_policy": network_policy,
+                    "redirect_count": 0,
+                    "fallback_reason": result["error"],
+                    "search_fallback": search_fallback.get("search_fallback", {}),
+                }
+                if resolved_from_ref_id:
+                    fallback_result["resolved_from_ref_id"] = resolved_from_ref_id
+                truncation = _truncation_guidance(safe_url, max_chars, extract_mode, window)
+                if truncation:
+                    fallback_result["truncation"] = truncation
+                return fallback_result
+            result["search_fallback"] = search_fallback.get("search_fallback", search_fallback)
+        guidance = _fetch_failure_guidance(error_type, diagnostics.get("recommendation") if diagnostics else None)
+        fallback_info = result.get("search_fallback")
+        if (
+            isinstance(fallback_info, dict)
+            and fallback_info.get("candidates")
+            and not fallback_info.get("exact_url_match")
+        ):
+            guidance["recommended_next_action"] = (
+                "Search by title/snippet first and fetch the returned ref_id; "
+                "search fallback returned candidates but none matched the requested URL exactly."
+            )
+            guidance["do_not_retry_reason"] = (
+                "Fetch search fallback found only inexact candidates; repeating fetch_url with the same URL is unlikely to help."
+            )
+        result.update(guidance)
         return result
 
 
@@ -2148,6 +2819,7 @@ async def research_brief(
                 max_chars=max_chars_per_source,
                 start_index=0,
                 extract_mode="auto",
+                search_fallback_query=_clean_text(f"{result.get('title', '')} {result.get('snippet', '')}"),
                 config=config,
                 status_callback=status.add,
             )
@@ -2176,6 +2848,8 @@ async def research_brief(
                     source["error_type"] = fetched.get("error_type")
                 if fetched.get("fetch_diagnostics"):
                     source["fetch_diagnostics"] = fetched.get("fetch_diagnostics")
+                if fetched.get("search_fallback"):
+                    source["search_fallback"] = fetched.get("search_fallback")
                 for key in ("retryable", "retry_after_seconds", "do_not_retry_reason", "recommended_next_action"):
                     if key in fetched:
                         source[key] = fetched[key]
@@ -2232,9 +2906,42 @@ async def check_health(config_path: str | Path | None = None) -> dict[str, Any]:
     async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT) as client:
         for provider in search_providers:
             try:
-                backend, url, params = _search_backend_health_request(provider, config)
-                response = await client.get(url, params=params, follow_redirects=True)
+                backend, url, params, headers = _search_backend_health_request(provider, config)
+                request_kwargs = {"params": params, "follow_redirects": True}
+                if headers:
+                    request_kwargs["headers"] = headers
+                response = await client.get(url, **request_kwargs)
                 ok = 200 <= response.status_code < 400
+                if ok and backend.startswith(CUSTOM_SEARCH_PROVIDER_PREFIX):
+                    custom_name = backend[len(CUSTOM_SEARCH_PROVIDER_PREFIX) :]
+                    spec = (_cfg(config, "custom_search_apis", {}) or {}).get(custom_name)
+                    if isinstance(spec, dict):
+                        try:
+                            payload = response.json()
+                            _validate_custom_search_api_payload(payload, spec)
+                        except Exception as exc:
+                            ok = False
+                            status = {"ok": False, "status": response.status_code, "error": f"{type(exc).__name__}: {exc}"}
+                            checks["search_backend_status"][backend] = status
+                            continue
+                        results, diagnostics = normalize_custom_search_api_results_with_diagnostics(
+                            payload,
+                            spec,
+                            max_results=1,
+                        )
+                        status = {
+                            "ok": ok,
+                            "status": response.status_code,
+                            "raw_result_count": diagnostics["raw_result_count"],
+                            "usable_result_count": len(results),
+                        }
+                        for key in ("results_path", "title_path", "url_path", "snippet_path"):
+                            if diagnostics.get(key):
+                                status[key] = diagnostics[key]
+                        checks["search_backend_status"][backend] = status
+                        if status["ok"] and checks["first_available_search_backend"] is None:
+                            checks["first_available_search_backend"] = backend
+                        continue
                 if not ok and backend == "searxng":
                     html_response = await client.get(
                         url,

@@ -23,7 +23,7 @@
 
 ## 后续计划
 
-- 当前已支持 DuckDuckGo HTML、Bing 中文入口、SearXNG 和 Mojeek。后续可以继续接入 Tavily、Brave Search、Exa、Serper 等可选搜索后端。
+- 当前已支持 DuckDuckGo HTML、国际版 Bing、Bing 中文入口、SearXNG、Mojeek，以及配置驱动的 `custom:<name>` 自定义搜索 API。Brave Search、Serper、Tavily、Exa 或自建搜索网关可以优先通过 `custom_search_apis` 接入；只有字段结构明显特殊、通用配置覆盖不了时，再考虑做专用后端。
 - 搜索后端配置可以继续扩展为：
 
 ```json

@@ -965,6 +965,16 @@ def test_load_config_keeps_ordered_search_providers(tmp_path):
     assert config.search_providers == ("duckduckgo", "bing_cn")
 
 
+def test_load_config_accepts_utf8_bom_config(tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"search_providers": ["custom:zhihu", "bing"]}', encoding="utf-8-sig")
+
+    config = web.load_config(config_path)
+
+    assert config.search_provider == "custom:zhihu"
+    assert config.search_providers == ("custom:zhihu", "bing")
+
+
 def test_load_config_defaults_to_international_bing_before_bing_cn(monkeypatch, tmp_path):
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
@@ -1021,6 +1031,425 @@ def test_search_providers_prefer_explicit_chain_over_legacy_provider(tmp_path):
 
     assert config.search_provider == "searxng"
     assert config.search_providers == ("duckduckgo", "bing_cn")
+
+
+def test_load_config_keeps_custom_search_api_definitions(monkeypatch, tmp_path):
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "secret-token")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "search_providers": ["custom:brave", "bing"],
+                "custom_search_apis": {
+                    "brave": {
+                        "url": "https://api.search.brave.com/res/v1/web/search",
+                        "headers": {"X-Subscription-Token": "${BRAVE_SEARCH_API_KEY}"},
+                        "params": {"q": "{query}", "api_key": "secret-token", "keyword": "{query}"},
+                        "results_path": "web.results",
+                        "title_path": "title",
+                        "url_path": "url",
+                        "snippet_path": "description",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = web.load_config(config_path)
+
+    assert config.search_provider == "custom:brave"
+    assert config.search_providers == ("custom:brave", "bing")
+    assert config.custom_search_apis["brave"]["headers"]["X-Subscription-Token"] == "secret-token"
+
+
+def test_search_web_uses_custom_json_search_api(monkeypatch):
+    class Config:
+        search_provider = "custom:brave"
+        search_providers = ("custom:brave",)
+        custom_search_apis = {
+            "brave": {
+                "url": "https://api.search.example/search",
+                "headers": {"X-Api-Key": "secret-token"},
+                "params": {"q": "{query}", "count": "{max_results}", "lang": "{language}"},
+                "results_path": "web.results",
+                "title_path": "title",
+                "url_path": "url",
+                "snippet_path": "description",
+            }
+        }
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "web": {
+                    "results": [
+                        {
+                            "title": "Health Result",
+                            "url": "https://example.com/health",
+                            "description": "Health summary",
+                        }
+                    ]
+                }
+            }
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "web": {
+                    "results": [
+                        {
+                            "title": "Custom Result",
+                            "url": "https://example.com/custom",
+                            "description": "Result from configured API",
+                        }
+                    ]
+                }
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            assert kwargs["headers"]["X-Api-Key"] == "secret-token"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            assert url == "https://api.search.example/search"
+            assert params == {"q": "mcp docs", "count": "2", "lang": "en"}
+            return FakeResponse()
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("mcp docs", max_results=2, language="en", config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "custom:brave"
+    assert result["results"][0]["title"] == "Custom Result"
+    assert result["results"][0]["url"] == "https://example.com/custom"
+    assert result["results"][0]["snippet"] == "Result from configured API"
+    assert result["results"][0]["ref_id"].startswith("ccweb-search-")
+
+
+def test_search_web_renders_custom_api_unix_timestamp(monkeypatch):
+    monkeypatch.setattr(web.time, "time", lambda: 1_777_777_777.9)
+
+    class Config:
+        search_provider = "custom:zhihu"
+        search_providers = ("custom:zhihu",)
+        custom_search_apis = {
+            "zhihu": {
+                "url": "https://developer.zhihu.com/api/v1/content/zhihu_search",
+                "headers": {
+                    "Authorization": "Bearer secret-token",
+                    "X-Request-Timestamp": "{unix_timestamp}",
+                },
+                "params": {"Query": "{query}", "Count": "{max_results}"},
+                "results_path": "Data",
+                "title_path": "Title",
+                "url_path": "URL",
+                "snippet_path": "Excerpt",
+            }
+        }
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"Code": 0, "Data": [{"Title": "知乎结果", "URL": "https://zhihu.com/p/1", "Excerpt": "摘要"}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            assert kwargs["headers"]["X-Request-Timestamp"] == "1777777777"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            assert params == {"Query": "怎么理解rave文化", "Count": "5"}
+            return FakeResponse()
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("怎么理解rave文化", max_results=5, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "custom:zhihu"
+    assert result["results"][0]["title"] == "知乎结果"
+
+
+def test_custom_search_api_raises_when_response_success_code_mismatches(monkeypatch):
+    class Config:
+        search_provider = "custom:zhihu"
+        search_providers = ("custom:zhihu",)
+        custom_search_apis = {
+            "zhihu": {
+                "url": "https://developer.zhihu.com/api/v1/content/zhihu_search",
+                "headers": {"Authorization": "Bearer secret-token"},
+                "params": {"Query": "{query}", "Count": "{max_results}"},
+                "success_code_path": "Code",
+                "success_codes": [0, 200],
+                "message_path": "Message",
+                "results_path": "Data",
+                "title_path": "Title",
+                "url_path": "URL",
+            }
+        }
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"Code": 20001, "Message": "Authorization failed", "Data": None}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            return FakeResponse()
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("怎么理解rave文化", max_results=5, config=Config()))
+
+    assert result["ok"] is False
+    assert "custom api response code mismatch" in result["error"]
+    assert "Authorization failed" in result["error"]
+
+
+def test_normalize_custom_search_api_results_accepts_path_candidates():
+    payload = {
+        "data": {
+            "data": [
+                {
+                    "object": {
+                        "title": "知乎结果",
+                        "url": "https://www.zhihu.com/question/123/answer/456",
+                        "excerpt": "来自嵌套对象的摘要",
+                    }
+                }
+            ]
+        }
+    }
+    spec = {
+        "results_path": ["data.results", "data.data"],
+        "title_path": ["title", "object.title"],
+        "url_path": ["url", "object.url"],
+        "snippet_path": ["description", "object.excerpt"],
+    }
+
+    results = web.normalize_custom_search_api_results(payload, spec, max_results=3)
+
+    assert results == [
+        {
+            "title": "知乎结果",
+            "url": "https://www.zhihu.com/question/123/answer/456",
+            "snippet": "来自嵌套对象的摘要",
+        }
+    ]
+
+
+def test_normalize_custom_search_api_results_auto_detects_common_paths():
+    payload = {
+        "Data": {
+            "Items": [
+                {
+                    "Title": "Zhihu Result",
+                    "Url": "https://zhuanlan.zhihu.com/p/1",
+                    "ContentText": "A useful Zhihu summary",
+                }
+            ]
+        }
+    }
+
+    results = web.normalize_custom_search_api_results(payload, {}, max_results=3)
+
+    assert results == [
+        {
+            "title": "Zhihu Result",
+            "url": "https://zhuanlan.zhihu.com/p/1",
+            "snippet": "A useful Zhihu summary",
+        }
+    ]
+
+
+def test_normalize_custom_search_api_results_preserves_configured_metadata():
+    payload = {
+        "Data": {
+            "Items": [
+                {
+                    "Title": "Zhihu Result",
+                    "Url": "https://zhuanlan.zhihu.com/p/1",
+                    "ContentText": "A useful Zhihu excerpt",
+                    "ContentID": "883616180275230693",
+                    "ContentType": "Article",
+                    "AuthorName": "雨放不下",
+                    "VoteUpCount": 53,
+                }
+            ]
+        }
+    }
+    spec = {
+        "extra_paths": {
+            "content_id": "ContentID",
+            "content_type": "ContentType",
+            "author": "AuthorName",
+            "vote_up_count": "VoteUpCount",
+        }
+    }
+
+    results = web.normalize_custom_search_api_results(payload, spec, max_results=3)
+
+    assert results[0]["metadata"] == {
+        "content_id": "883616180275230693",
+        "content_type": "Article",
+        "author": "雨放不下",
+        "vote_up_count": 53,
+    }
+
+
+def test_search_result_surrogate_markdown_includes_metadata():
+    markdown = web._search_result_to_surrogate_markdown(
+        {
+            "title": "Zhihu Result",
+            "url": "https://zhuanlan.zhihu.com/p/1",
+            "snippet": "A useful Zhihu excerpt",
+            "metadata": {
+                "content_type": "Article",
+                "content_id": "883616180275230693",
+                "author": "雨放不下",
+            },
+        }
+    )
+
+    assert "Content Type: Article" in markdown
+    assert "Content Id: 883616180275230693" in markdown
+    assert "Author: 雨放不下" in markdown
+    assert "A useful Zhihu excerpt" in markdown
+
+
+def test_search_web_reports_custom_api_field_mapping_diagnostics(monkeypatch):
+    class Config:
+        search_provider = "custom:broken"
+        search_providers = ("custom:broken",)
+        custom_search_apis = {
+            "broken": {
+                "url": "https://api.search.example/search",
+                "params": {"q": "{query}"},
+                "results_path": "items",
+                "title_path": "headline",
+                "url_path": "link",
+            }
+        }
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"items": [{"headline": "No URL item", "summary": "Missing URL"}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            return FakeResponse()
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("docs", max_results=3, config=Config()))
+
+    assert result["ok"] is False
+    assert "raw_result_count=1" in result["error"]
+    assert "missing_url=1" in result["error"]
+    assert "url_path=link" in result["error"]
+
+
+def test_search_web_skips_custom_provider_when_general_search_disabled(monkeypatch):
+    class Config:
+        search_provider = "duckduckgo"
+        search_providers = ("duckduckgo", "custom:zhihu")
+        custom_search_apis = {
+            "zhihu": {
+                "url": "https://developer.zhihu.com/api/v1/content/global_search",
+                "params": {"Query": "{query}", "Count": "{max_results}"},
+                "enable_general_search": False,
+            }
+        }
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+
+    calls = []
+
+    async def fake_search_with_provider(provider, query, max_results, region, language, config):
+        calls.append(provider)
+        if provider == "duckduckgo":
+            raise web.SearchBackendUnavailableError("duckduckgo unavailable")
+        raise AssertionError("custom provider should not run as general search fallback")
+
+    monkeypatch.setattr(web, "_search_with_provider", fake_search_with_provider)
+
+    result = asyncio.run(web.search_web("Claude Code MCP stdio configuration", config=Config()))
+
+    assert result["ok"] is False
+    assert calls == ["duckduckgo"]
+    assert result["attempted_backends"][1]["backend"] == "custom:zhihu"
+    assert result["attempted_backends"][1]["skipped"] is True
+    assert "general_search_disabled" in result["attempted_backends"][1]["error"]
 
 
 def test_check_health_reports_configured_search_provider_chain(monkeypatch, tmp_path):
@@ -1104,6 +1533,134 @@ def test_check_health_reports_international_bing_provider(monkeypatch, tmp_path)
 
     assert health["search_providers"] == ["bing"]
     assert health["search_backend_status"]["bing"] == {"ok": True, "status": 200}
+    assert health["first_available_search_backend"] == "bing"
+
+
+def test_check_health_reports_custom_search_api_provider(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "search_providers": ["custom:brave"],
+                "custom_search_apis": {
+                    "brave": {
+                        "url": "https://api.search.example/search",
+                        "headers": {"X-Api-Key": "secret-token"},
+                        "params": {"q": "{query}", "api_key": "secret-token", "keyword": "{query}"},
+                        "results_path": "web.results",
+                        "title_path": "title",
+                        "url_path": "url",
+                        "snippet_path": "description",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "web": {
+                    "results": [
+                        {
+                            "title": "Health Result",
+                            "url": "https://example.com/health",
+                            "description": "Health summary",
+                        }
+                    ]
+                }
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True, headers=None):
+            if url == "https://api.search.example/search":
+                assert headers == {"X-Api-Key": "secret-token"}
+                assert params == {"q": "cc-web health", "api_key": "secret-token", "keyword": "cc-web health"}
+                return FakeResponse()
+            return FakeResponse()
+
+    monkeypatch.setattr(web, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    health = asyncio.run(web.check_health())
+
+    assert health["search_providers"] == ["custom:brave"]
+    assert health["config"]["custom_search_apis"]["brave"]["url"] == "https://api.search.example/search"
+    assert health["config"]["custom_search_apis"]["brave"]["headers"]["X-Api-Key"] == "***"
+    assert health["config"]["custom_search_apis"]["brave"]["params"]["q"] == "{query}"
+    assert health["config"]["custom_search_apis"]["brave"]["params"]["api_key"] == "***"
+    assert health["config"]["custom_search_apis"]["brave"]["params"]["keyword"] == "{query}"
+    assert health["search_backend_status"]["custom:brave"]["ok"] is True
+    assert health["search_backend_status"]["custom:brave"]["status"] == 200
+    assert health["search_backend_status"]["custom:brave"]["raw_result_count"] == 1
+    assert health["search_backend_status"]["custom:brave"]["usable_result_count"] == 1
+    assert health["search_backend_status"]["custom:brave"]["results_path"] == "web.results"
+    assert health["first_available_search_backend"] == "custom:brave"
+
+
+def test_check_health_marks_custom_api_business_error_unavailable(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "search_providers": ["custom:zhihu", "bing"],
+                "custom_search_apis": {
+                    "zhihu": {
+                        "url": "https://developer.zhihu.com/api/v1/content/zhihu_search",
+                        "headers": {"Authorization": "Bearer secret-token"},
+                        "params": {"Query": "{query}", "Count": "{max_results}"},
+                        "success_code_path": "Code",
+                        "success_codes": [0, 200],
+                        "message_path": "Message",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeResponse:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+
+        def json(self):
+            return self._payload
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True, headers=None):
+            if "developer.zhihu.com" in url:
+                return FakeResponse(200, {"Code": 20001, "Message": "Authorization failed", "Data": None})
+            return FakeResponse(200)
+
+    monkeypatch.setattr(web, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    health = asyncio.run(web.check_health())
+
+    assert health["search_backend_status"]["custom:zhihu"]["ok"] is False
+    assert "Authorization failed" in health["search_backend_status"]["custom:zhihu"]["error"]
     assert health["first_available_search_backend"] == "bing"
 
 
@@ -1912,6 +2469,380 @@ def test_fetch_page_keeps_direct_anti_bot_diagnostics_when_jina_fallback_fails(m
     assert result["ok"] is False
     assert result["error_type"] == "captcha_or_challenge"
     assert result["fetch_diagnostics"]["confidence"] == "high"
+
+
+def test_fetch_page_uses_exact_search_fallback_when_blocked(monkeypatch, public_dns):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = True
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+        enable_fetch_search_fallback = True
+        fetch_search_fallback_domains = ("zhihu.com", "zhuanlan.zhihu.com")
+        fetch_search_fallback_providers = ("custom:zhihu",)
+        fetch_search_fallback_mode = "exact_or_candidates"
+        max_fetch_search_fallback_results = 3
+
+    async def fake_limited_get(client, url, allow_private_networks=False, trusted_proxy_domains=None):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    async def failing_jina_reader(client, url, **kwargs):
+        request = httpx.Request("GET", "https://r.jina.ai/" + url)
+        raise httpx.ReadTimeout("jina timed out", request=request)
+
+    async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None, **kwargs):
+        assert config.search_providers == ("custom:zhihu",)
+        return {
+            "ok": True,
+            "backend": "custom:zhihu",
+            "results": [
+                {
+                    "title": "Blocked Zhihu Article",
+                    "url": "https://zhuanlan.zhihu.com/p/123?utm_medium=openapi_platform",
+                    "snippet": "Article content from API",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+    monkeypatch.setattr(web, "_fetch_jina_reader_markdown", failing_jina_reader, raising=False)
+    monkeypatch.setattr(web, "search_web", fake_search_web)
+
+    result = asyncio.run(web.fetch_page("https://zhuanlan.zhihu.com/p/123", config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "search_fallback:custom:zhihu"
+    assert result["source_type"] == "search_result_surrogate"
+    assert result["exact_url_match"] is True
+    assert result["matched_url"] == "https://zhuanlan.zhihu.com/p/123?utm_medium=openapi_platform"
+    assert "# Blocked Zhihu Article" in result["markdown"]
+    assert "Article content from API" in result["markdown"]
+
+
+def test_fetch_page_uses_ref_title_for_search_fallback_query(monkeypatch, public_dns):
+    monkeypatch.setattr(web, "_BROWSE_SESSION", web.BrowseSession())
+    ref_id = web._BROWSE_SESSION.add(
+        "search",
+        "https://zhuanlan.zhihu.com/p/123",
+        title="Deepseek-V4模型结构与源码解析 - 知乎",
+        snippet="介绍 DS-V4 模型架构与算子流程",
+    )
+
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+        enable_fetch_search_fallback = True
+        fetch_search_fallback_domains = ("zhihu.com", "zhuanlan.zhihu.com")
+        fetch_search_fallback_providers = ("custom:zhihu",)
+        fetch_search_fallback_mode = "exact_or_candidates"
+        max_fetch_search_fallback_results = 3
+
+    async def fake_limited_get(client, url, allow_private_networks=False, trusted_proxy_domains=None):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None, **kwargs):
+        assert "Deepseek-V4模型结构与源码解析" in query
+        assert "zhuanlan.zhihu.com/p/123" not in query
+        return {
+            "ok": True,
+            "backend": "custom:zhihu",
+            "results": [
+                {
+                    "title": "Deepseek-V4模型结构与源码解析 - 知乎",
+                    "url": "https://zhuanlan.zhihu.com/p/123?utm_medium=openapi_platform",
+                    "snippet": "API article content",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+    monkeypatch.setattr(web, "search_web", fake_search_web)
+
+    result = asyncio.run(web.fetch_page(ref_id=ref_id, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "search_fallback:custom:zhihu"
+    assert result["search_fallback"]["query"].startswith("Deepseek-V4模型结构与源码解析")
+
+
+def test_fetch_page_uses_session_title_for_search_fallback_query_when_url_matches(monkeypatch, public_dns):
+    monkeypatch.setattr(web, "_BROWSE_SESSION", web.BrowseSession())
+    web._BROWSE_SESSION.add(
+        "search",
+        "https://zhuanlan.zhihu.com/p/123?utm_medium=openapi_platform",
+        title="Deepseek-V4模型结构与源码解析 - 知乎",
+        snippet="介绍 DS-V4 模型架构与算子流程",
+    )
+
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+        enable_fetch_search_fallback = True
+        fetch_search_fallback_domains = ("zhihu.com", "zhuanlan.zhihu.com")
+        fetch_search_fallback_providers = ("custom:zhihu",)
+        fetch_search_fallback_mode = "exact_or_candidates"
+        max_fetch_search_fallback_results = 3
+
+    async def fake_limited_get(client, url, allow_private_networks=False, trusted_proxy_domains=None):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None, **kwargs):
+        assert "Deepseek-V4模型结构与源码解析" in query
+        assert "zhuanlan.zhihu.com/p/123" not in query
+        return {
+            "ok": True,
+            "backend": "custom:zhihu",
+            "results": [
+                {
+                    "title": "Deepseek-V4模型结构与源码解析 - 知乎",
+                    "url": "https://zhuanlan.zhihu.com/p/123?utm_medium=openapi_platform",
+                    "snippet": "API article content",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+    monkeypatch.setattr(web, "search_web", fake_search_web)
+
+    result = asyncio.run(web.fetch_page("https://zhuanlan.zhihu.com/p/123", config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "search_fallback:custom:zhihu"
+    assert result["search_fallback"]["query"].startswith("Deepseek-V4模型结构与源码解析")
+
+
+def test_fetch_page_discovers_title_when_url_only_search_fallback_misses(monkeypatch, public_dns):
+    class Config:
+        search_provider = "duckduckgo"
+        search_providers = ("duckduckgo", "bing", "custom:zhihu")
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+        enable_fetch_search_fallback = True
+        fetch_search_fallback_domains = ("zhuanlan.zhihu.com",)
+        fetch_search_fallback_providers = ("custom:zhihu",)
+        fetch_search_fallback_mode = "exact_or_candidates"
+        max_fetch_search_fallback_results = 3
+
+    calls = []
+
+    async def fake_limited_get(client, url, allow_private_networks=False, trusted_proxy_domains=None):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None, **kwargs):
+        calls.append((query, config.search_providers))
+        if config.search_providers == ("custom:zhihu",) and query.startswith("https://"):
+            return {
+                "ok": True,
+                "backend": "custom:zhihu",
+                "results": [
+                    {
+                        "title": "Unrelated Zhihu Result",
+                        "url": "https://www.zhihu.com/question/1/answer/2",
+                        "snippet": "Not the target article",
+                    }
+                ],
+            }
+        if config.search_providers == ("duckduckgo", "bing"):
+            return {
+                "ok": True,
+                "backend": "duckduckgo_html",
+                "results": [
+                    {
+                        "title": "Claude Code接DeepSeek后,缺的那块Web搜索我补上了 - 知乎",
+                        "url": "https://zhuanlan.zhihu.com/p/2038271627167848097",
+                        "snippet": "Firecrawl / Tavily / Brave 更像专业搜索、抓取或网页研究服务。",
+                    }
+                ],
+            }
+        if config.search_providers == ("custom:zhihu",):
+            assert "Claude Code接DeepSeek后" in query
+            return {
+                "ok": True,
+                "backend": "custom:zhihu",
+                "results": [
+                    {
+                        "title": "Claude Code接DeepSeek后,缺的那块Web搜索我补上了 - 知乎",
+                        "url": "https://zhuanlan.zhihu.com/p/2038271627167848097?utm_medium=openapi_platform",
+                        "snippet": "API article excerpt",
+                    }
+                ],
+            }
+        raise AssertionError(f"unexpected call: {query}, {config.search_providers}")
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+    monkeypatch.setattr(web, "search_web", fake_search_web)
+
+    result = asyncio.run(web.fetch_page("https://zhuanlan.zhihu.com/p/2038271627167848097", config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "search_fallback:custom:zhihu"
+    assert result["exact_url_match"] is True
+    assert result["search_fallback"]["query"].startswith("Claude Code接DeepSeek后")
+    assert result["search_fallback"]["discovered_from"]["backend"] == "duckduckgo_html"
+    assert [providers for _query, providers in calls] == [
+        ("custom:zhihu",),
+        ("duckduckgo", "bing"),
+        ("custom:zhihu",),
+    ]
+
+
+def test_fetch_search_fallback_can_use_custom_provider_with_general_search_disabled(monkeypatch, public_dns):
+    class Config:
+        search_provider = "duckduckgo"
+        search_providers = ("duckduckgo", "custom:zhihu")
+        custom_search_apis = {
+            "zhihu": {
+                "url": "https://developer.zhihu.com/api/v1/content/global_search",
+                "enable_general_search": False,
+            }
+        }
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+        enable_fetch_search_fallback = True
+        fetch_search_fallback_domains = ("zhuanlan.zhihu.com",)
+        fetch_search_fallback_providers = ("custom:zhihu",)
+        fetch_search_fallback_mode = "exact_or_candidates"
+        max_fetch_search_fallback_results = 3
+
+    async def fake_limited_get(client, url, allow_private_networks=False, trusted_proxy_domains=None):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None, **kwargs):
+        assert config.search_providers == ("custom:zhihu",)
+        return {
+            "ok": True,
+            "backend": "custom:zhihu",
+            "results": [
+                {
+                    "title": "Zhihu Article",
+                    "url": "https://zhuanlan.zhihu.com/p/123?utm_medium=openapi_platform",
+                    "snippet": "API article excerpt",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+    monkeypatch.setattr(web, "search_web", fake_search_web)
+
+    result = asyncio.run(web.fetch_page("https://zhuanlan.zhihu.com/p/123", config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "search_fallback:custom:zhihu"
+
+
+def test_fetch_page_returns_search_fallback_candidates_when_no_exact_match(monkeypatch, public_dns):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+        enable_fetch_search_fallback = True
+        fetch_search_fallback_domains = ("zhihu.com",)
+        fetch_search_fallback_providers = ("custom:zhihu",)
+        fetch_search_fallback_mode = "exact_or_candidates"
+        max_fetch_search_fallback_results = 2
+
+    async def fake_limited_get(client, url, allow_private_networks=False, trusted_proxy_domains=None):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None, **kwargs):
+        return {
+            "ok": True,
+            "backend": "custom:zhihu",
+            "results": [
+                {
+                    "title": "Related Zhihu Article",
+                    "url": "https://www.zhihu.com/question/1/answer/2",
+                    "snippet": "Related but not exact",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+    monkeypatch.setattr(web, "search_web", fake_search_web)
+
+    result = asyncio.run(web.fetch_page("https://www.zhihu.com/question/19550256", config=Config()))
+
+    assert result["ok"] is False
+    assert result["error_type"] == "blocked_or_waf"
+    assert result["search_fallback"]["backend"] == "custom:zhihu"
+    assert result["search_fallback"]["exact_url_match"] is False
+    assert result["search_fallback"]["candidates"][0]["title"] == "Related Zhihu Article"
+    assert "ref_id" in result["recommended_next_action"]
+
+
+def test_fetch_page_does_not_treat_result_snippet_url_as_exact_search_fallback(monkeypatch, public_dns):
+    class Config:
+        default_fetch_chars = 1000
+        max_fetch_chars = 60000
+        enable_jina_fallback = False
+        jina_min_chars = 300
+        allow_private_networks = False
+        cache_ttl_seconds = 0
+        enable_fetch_search_fallback = True
+        fetch_search_fallback_domains = ("zhuanlan.zhihu.com",)
+        fetch_search_fallback_providers = ("custom:zhihu",)
+        fetch_search_fallback_mode = "exact_or_candidates"
+        max_fetch_search_fallback_results = 2
+
+    async def fake_limited_get(client, url, allow_private_networks=False, trusted_proxy_domains=None):
+        request = httpx.Request("GET", url)
+        response = httpx.Response(403, request=request)
+        raise httpx.HTTPStatusError("forbidden", request=request, response=response)
+
+    async def fake_search_web(query, max_results=5, region="wt-wt", language="zh-cn", config=None, **kwargs):
+        return {
+            "ok": True,
+            "backend": "custom:zhihu",
+            "results": [
+                {
+                    "title": "Mirror mention",
+                    "url": "https://www.zhihu.com/question/6408910823/answer/117241123751",
+                    "snippet": "https://zhuanlan.zhihu.com/p/26801088782",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(web, "_limited_get", fake_limited_get)
+    monkeypatch.setattr(web, "search_web", fake_search_web)
+
+    result = asyncio.run(web.fetch_page("https://zhuanlan.zhihu.com/p/26801088782", config=Config()))
+
+    assert result["ok"] is False
+    assert result["search_fallback"]["exact_url_match"] is False
+    assert result["search_fallback"]["candidates"][0]["url"] == "https://www.zhihu.com/question/6408910823/answer/117241123751"
 
 
 def test_research_brief_returns_compact_sources(monkeypatch, public_dns):

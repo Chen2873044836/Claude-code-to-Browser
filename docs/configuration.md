@@ -121,6 +121,55 @@ cc-web-mcp config init
 - `brief_concurrency`：`research_brief` 并发抓取数量。
 - `dedupe_domains`：`research_brief` 是否按域名去重。
 
+## 自定义搜索 API
+
+如果你有第三方搜索 API 或自建搜索网关，可以通过 `custom_search_apis` 手动增加后端，然后在 `search_providers` 里使用 `custom:<name>`。
+
+```json
+{
+  "search_providers": ["custom:brave", "searxng", "bing"],
+  "custom_search_apis": {
+    "brave": {
+      "url": "https://api.search.brave.com/res/v1/web/search",
+      "method": "GET",
+      "headers": {
+        "X-Subscription-Token": "${BRAVE_SEARCH_API_KEY}"
+      },
+      "params": {
+        "q": "{query}",
+        "count": "{max_results}",
+        "search_lang": "{language}"
+      },
+      "results_path": "web.results",
+      "title_path": "title",
+      "url_path": "url",
+      "snippet_path": "description"
+    }
+  }
+}
+```
+
+字段说明：
+
+- `custom:<name>` 会读取 `custom_search_apis.<name>`。
+- `headers`、`params`、`json` 和 `url` 支持 `${ENV_NAME}` 环境变量占位，适合保存 API key。
+- 请求模板支持 `{query}`、`{max_results}`、`{language}`、`{region}` 和 `{unix_timestamp}`。
+- `results_path`、`title_path`、`url_path`、`snippet_path` 使用简单点号路径，例如 `web.results` 或 `organic_results`。这些字段可以省略，cc-web 会自动尝试 `results/items/data/Data.Items/web.results/organic_results` 以及 `title/url/snippet/description/ContentText` 等常见字段。
+- `extra_paths` 可以把额外字段保留到结果的 `metadata`，例如 `{"content_id": "ContentID", "author": "AuthorName"}`。这些字段会在 `fetch_url` 的搜索 fallback surrogate markdown 中展示，适合保留内容类型、作者、点赞数、评论数等上下文。
+- `enable_general_search` 默认为 `true`。如果某个 API 只适合定向 fallback，例如知乎内容 API，可以设为 `false`；这样它不会参与普通 `web_search` 的末尾兜底，但仍可被 `fetch_search_fallback_providers` 和 `config test-search` 使用。
+- 如果一个 API 有自己的业务成功码，可以配置 `success_code_path`、`success_codes` 和 `message_path`，避免 HTTP 200 但业务失败时被误判为可用。
+- `method` 默认是 `GET`；需要 POST 时可以配置 `"method": "POST"` 和 `"json": {...}`。
+
+`health_check` 会把自定义后端显示为 `custom:<name>`，并使用同一套 URL、headers 和 params 做轻量探测。返回里会包含 `raw_result_count`、`usable_result_count` 和命中的字段路径，方便判断是请求失败还是字段映射失败。不要把私密 API key 直接写进配置文件，优先使用环境变量。
+
+本地调试单个后端时，可以先跑：
+
+```powershell
+cc-web-mcp config test-search custom:zhihu "deepseek" --max-results 3
+```
+
+这个命令会临时只启用指定 provider，并输出规范化后的搜索结果和诊断字段。
+
 ## Jina Reader fallback
 
 `enable_jina_fallback` 控制普通抓取失败、403 或正文太短时是否尝试 Jina Reader。
@@ -132,6 +181,32 @@ cc-web-mcp config init
 `jina_min_chars` 控制正文过短时触发 fallback 的阈值。Jina fallback 内部会重复做 URL 安全校验，并默认禁止内网 URL 走 Jina。
 
 启用 Jina Reader fallback 时，目标 URL 会经过第三方服务；不要用于私密链接或内网页面。
+
+## Fetch Search fallback
+
+`fetch_url` 默认不会把“相关搜索结果”冒充成原 URL 正文。对于知乎这类容易 403、挑战页或正文过短的网站，可以开启抓取失败后的定向搜索 fallback：
+
+```json
+{
+  "enable_fetch_search_fallback": true,
+  "fetch_search_fallback_domains": ["zhihu.com", "zhuanlan.zhihu.com"],
+  "fetch_search_fallback_providers": ["custom:zhihu"],
+  "fetch_search_fallback_mode": "exact_or_candidates",
+  "max_fetch_search_fallback_results": 3
+}
+```
+
+执行顺序是：
+
+```text
+direct fetch -> Jina Reader fallback -> search fallback
+```
+
+如果搜索结果 URL 与原 URL 规范化后精确匹配，`fetch_url` 会返回 `ok: true`，并标注 `backend: "search_fallback:<provider>"`、`source_type: "search_result_surrogate"`、`exact_url_match`、`matched_url` 和 `fallback_reason`。
+
+如果没有精确匹配，默认不会返回成功正文，而是在失败结果里附带 `search_fallback.candidates`，让模型知道有哪些相关候选，但不要把它们当作原文。
+
+`research_brief` 内部抓取搜索结果失败时，会把搜索结果的 title/snippet 作为 fallback query，避免用 URL 直接搜索导致命中质量差。普通 `web_search` 的后端顺序不需要因此把 `custom:zhihu` 前移。
 
 ## 缓存与安全开关
 

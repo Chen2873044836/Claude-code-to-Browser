@@ -93,6 +93,9 @@ cc-web-mcp config path
 - 同时适配更多第三方模型：`"allowed_model_patterns": ["deepseek", "qwen", "kimi"]`
 - DuckDuckGo 不稳定时只使用国际版 Bing：`"search_providers": ["bing"]`
 - 增加 Mojeek 作为轻量 fallback：`"search_providers": ["duckduckgo", "bing", "mojeek", "bing_cn"]`
+- 接入第三方或自建搜索 API：在 `search_providers` 中加入 `custom:<name>`，并在 `custom_search_apis` 里配置 URL、headers、params 和结果字段路径。
+- 调试自定义搜索 API：`cc-web-mcp config test-search custom:zhihu "deepseek" --max-results 3`
+- 抓取受限站点时定向使用搜索 API：开启 `enable_fetch_search_fallback`，并把 `fetch_search_fallback_providers` 指到 `custom:<name>`。
 - 某个第三方 API 的原生 Web 工具已经可用时：`"block_native_web_for_allowed_models": false`
 - 明确允许官方 Claude 调用 `cc-web fetch_url`：`"allow_fetch_url_for_claude": true`
 

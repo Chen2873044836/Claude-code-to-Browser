@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import cc_web_mcp.cli as cli
 
 
@@ -109,3 +111,25 @@ def test_cli_passes_hook_guard_arguments(monkeypatch):
 
     assert result == 0
     assert captured == ["--config", "config.json", "--state", "state.json"]
+
+
+def test_cli_config_test_search_limits_to_provider(monkeypatch, capsys):
+    async def fake_search_web(query, max_results=5, config=None, **kwargs):
+        assert query == "deepseek"
+        assert max_results == 2
+        assert config.search_provider == "custom:zhihu"
+        assert config.search_providers == ("custom:zhihu",)
+        return {
+            "ok": True,
+            "backend": "custom:zhihu",
+            "results": [{"title": "Zhihu Result", "url": "https://zhihu.com/p/1", "snippet": "summary"}],
+        }
+
+    monkeypatch.setattr("cc_web_mcp.web.search_web", fake_search_web)
+
+    result = cli.main(["config", "test-search", "custom:zhihu", "deepseek", "--max-results", "2"])
+
+    assert result == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["backend"] == "custom:zhihu"
+    assert output["results"][0]["title"] == "Zhihu Result"

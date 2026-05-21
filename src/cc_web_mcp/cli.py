@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -49,6 +50,12 @@ def _dispatch_config(argv: list[str]) -> int:
     init_parser = subparsers.add_parser("init", help="Create the user config if it is missing.")
     init_parser.add_argument("--config", default=None)
 
+    test_search_parser = subparsers.add_parser("test-search", help="Run a search through one configured provider.")
+    test_search_parser.add_argument("provider")
+    test_search_parser.add_argument("query")
+    test_search_parser.add_argument("--max-results", type=int, default=3)
+    test_search_parser.add_argument("--config", default=None)
+
     args = parser.parse_args(argv)
     command = args.config_command or "path"
     explicit = Path(os.path.expanduser(args.config)) if getattr(args, "config", None) else None
@@ -66,6 +73,15 @@ def _dispatch_config(argv: list[str]) -> int:
             print(config_path.read_text(encoding="utf-8-sig").rstrip())
         else:
             print(json.dumps(default_config_dict(), ensure_ascii=False, indent=2))
+        return 0
+    if command == "test-search":
+        from cc_web_mcp import web
+
+        provider = web._normalize_search_provider_name(args.provider)
+        config = web.load_config(config_path)
+        test_config = web._config_with_search_providers(config, (provider,), force=True)
+        result = asyncio.run(web.search_web(args.query, max_results=args.max_results, config=test_config))
+        print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
     parser.error(f"unknown config command: {command}")
     return 2
