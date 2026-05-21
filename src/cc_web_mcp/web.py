@@ -40,7 +40,7 @@ REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
 DEFAULT_CONFIG_PATH = resolve_config_path()
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "cc-web-mcp"
 CACHE_SCHEMA_VERSION = 3
-SEARCH_CACHE_SCHEMA_VERSION = 3
+SEARCH_CACHE_SCHEMA_VERSION = 4
 BROWSE_REF_TTL_SECONDS = 1_800
 MAX_BROWSE_REFS = 200
 BING_CN_SCOPE_NOTE = "bing_cn may be region-biased and is used as fallback; it is not equivalent to full global search."
@@ -1522,6 +1522,76 @@ def rank_search_results(results: list[dict[str, str]]) -> list[dict[str, str]]:
     return ranked
 
 
+SEARCH_QUERY_STOPWORDS = {
+    "about",
+    "and",
+    "api",
+    "best",
+    "comparison",
+    "deep",
+    "dive",
+    "explained",
+    "guide",
+    "how",
+    "introduction",
+    "intro",
+    "mechanism",
+    "overview",
+    "performance",
+    "the",
+    "tutorial",
+    "vs",
+    "what",
+    "with",
+}
+
+
+def _search_query_terms(query: str) -> list[str]:
+    terms: list[str] = []
+    for raw in re.findall(r"[\w.+#-]+", query.lower()):
+        term = raw.strip("._-")
+        if len(term) < 3 or term in SEARCH_QUERY_STOPWORDS:
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms
+
+
+def _short_search_retry_query(query: str) -> str | None:
+    terms = _search_query_terms(query)
+    if len(terms) < 5:
+        return None
+    short_terms = terms[:3]
+    short_query = " ".join(short_terms)
+    if short_query and short_query != query.lower():
+        return short_query
+    return None
+
+
+def _query_result_relevance_score(query: str, results: list[dict[str, str]], limit: int = 3) -> int:
+    terms = _search_query_terms(query)[:5]
+    if not terms:
+        return 0
+    matched_terms: set[str] = set()
+    for result in results[:limit]:
+        haystack = " ".join(
+            str(result.get(field) or "").lower()
+            for field in ("title", "snippet", "url")
+        )
+        matched_terms.update(term for term in terms if term in haystack)
+    return len(matched_terms)
+
+
+def _should_retry_search_with_short_query(query: str, results: list[dict[str, str]]) -> str | None:
+    short_query = _short_search_retry_query(query)
+    if not short_query or not results:
+        return None
+    original_core_score = _query_result_relevance_score(short_query, results)
+    if original_core_score <= 2:
+        return short_query
+    return None
+
+
 def _provider_backend_name(provider: str) -> str:
     normalized = _normalize_search_provider_name(provider)
     custom_name = _custom_search_api_name(normalized)
@@ -2439,7 +2509,7 @@ async def _search_web_parallel(
         + f" for {query}"
     )
 
-    async def run_provider(provider: str) -> tuple[str, str, list[dict[str, Any]] | None, Exception | None]:
+    async def run_provider(provider: str) -> tuple[str, str, list[dict[str, Any]] | None, dict[str, Any] | None, Exception | None]:
         backend = _provider_backend_name(provider)
         try:
             backend, results = await _search_with_provider(
@@ -2450,15 +2520,28 @@ async def _search_web_parallel(
                 language,
                 config,
             )
-            return provider, backend, results, None
+            backend, results, retry_info = await _retry_provider_with_short_query_if_needed(
+                provider,
+                backend,
+                provider_query,
+                list(results or []),
+                provider_result_limit,
+                region,
+                language,
+                config,
+            )
+            if retry_info:
+                await status.add(f"cc-web: {backend} retried with shorter query {retry_info['query']}")
+            return provider, backend, results, retry_info, None
         except Exception as exc:  # noqa: BLE001
-            return provider, backend, None, exc
+            return provider, backend, None, None, exc
 
     provider_results = await asyncio.gather(*(run_provider(provider) for provider in candidate_providers))
     successful_results: list[tuple[str, list[dict[str, Any]]]] = []
     successful_backends: list[str] = []
+    query_retries: list[dict[str, Any]] = []
     last_error = ""
-    for _provider, backend, results, exc in provider_results:
+    for _provider, backend, results, retry_info, exc in provider_results:
         if exc is not None:
             last_error = f"{type(exc).__name__}: {exc}"
             attempted = {"backend": backend, "ok": False, "error": last_error}
@@ -2473,6 +2556,8 @@ async def _search_web_parallel(
         attempted_backends.append({"backend": backend, "ok": True})
         successful_backends.append(backend)
         successful_results.append((backend, list(results or [])))
+        if retry_info:
+            query_retries.append(retry_info)
 
     if not successful_results:
         return {
@@ -2524,6 +2609,8 @@ async def _search_web_parallel(
         }
     if "bing_cn" in successful_backends:
         response["search_scope_note"] = BING_CN_SCOPE_NOTE
+    if query_retries:
+        response["query_retries"] = query_retries
     if fallback_reason:
         response["fallback_reason"] = fallback_reason
     if usable_result_count == 0:
@@ -2539,6 +2626,41 @@ async def _search_web_parallel(
             }
         )
     return response
+
+
+async def _retry_provider_with_short_query_if_needed(
+    provider: str,
+    backend: str,
+    provider_query: str,
+    results: list[dict[str, str]],
+    provider_result_limit: int,
+    region: str,
+    language: str,
+    config: GlobalWebConfig | Any,
+) -> tuple[str, list[dict[str, str]], dict[str, Any] | None]:
+    retry_query = _should_retry_search_with_short_query(provider_query, results)
+    if not retry_query:
+        return backend, results, None
+    retry_backend, retry_results = await _search_with_provider(
+        provider,
+        retry_query,
+        provider_result_limit,
+        region,
+        language,
+        config,
+    )
+    original_score = _query_result_relevance_score(retry_query, results)
+    retry_score = _query_result_relevance_score(retry_query, retry_results)
+    if retry_results and retry_score > original_score:
+        return retry_backend, retry_results, {
+            "backend": retry_backend,
+            "reason": "low_relevance_results",
+            "original_query": provider_query,
+            "query": retry_query,
+            "original_score": original_score,
+            "retry_score": retry_score,
+        }
+    return backend, results, None
 
 
 def _exact_search_result(candidates: list[dict[str, Any]], safe_url: str) -> dict[str, Any] | None:
@@ -2767,6 +2889,19 @@ async def search_web(
         try:
             await status.add(f"cc-web: searching {backend} for {query}")
             backend, results = await _search_with_provider(provider, provider_query, provider_result_limit, region, language, config)
+            retry_info = None
+            backend, results, retry_info = await _retry_provider_with_short_query_if_needed(
+                provider,
+                backend,
+                provider_query,
+                list(results or []),
+                provider_result_limit,
+                region,
+                language,
+                config,
+            )
+            if retry_info:
+                await status.add(f"cc-web: {backend} retried with shorter query {retry_info['query']}")
             _clear_search_backend_cooldown(backend)
             raw_result_count = len(results[:provider_result_limit])
 
@@ -2801,6 +2936,8 @@ async def search_web(
                 }
             if backend == "bing_cn":
                 response["search_scope_note"] = BING_CN_SCOPE_NOTE
+            if retry_info:
+                response["query_retry"] = retry_info
             if fallback_reason:
                 response["fallback_reason"] = fallback_reason
             if _cfg(config, "search_cache_ttl_seconds", 0) > 0:
