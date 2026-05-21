@@ -30,6 +30,7 @@
   "cache_ttl_seconds": 1800,
   "search_cache_ttl_seconds": 300,
   "search_backend_cooldown_seconds": 60,
+  "search_cooldown_empty_results": true,
   "search_parallel_enabled": false,
   "search_parallel_max_backends": 2,
   "trust_tun_fake_ip_dns": false,

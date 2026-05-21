@@ -40,6 +40,7 @@ cc-web-mcp config init
   "cache_ttl_seconds": 1800,
   "search_cache_ttl_seconds": 300,
   "search_backend_cooldown_seconds": 60,
+  "search_cooldown_empty_results": true,
   "search_parallel_enabled": false,
   "search_parallel_max_backends": 2,
   "trust_tun_fake_ip_dns": false,
@@ -217,7 +218,7 @@ direct fetch -> Jina Reader fallback -> search fallback
 `cache_ttl_seconds` 控制公开 URL 正文抓取缓存时间。正文抓取缓存只在 `allow_private_networks: false` 时启用，缓存 key 包含 schema version，避免旧格式缓存污染新逻辑。
 
 `search_cache_ttl_seconds` 控制成功搜索结果的短缓存时间，默认 `300` 秒。它只缓存成功结果，不缓存失败或限流响应；它独立于 `allow_private_networks`，因为搜索缓存不抓取用户提供的任意 URL。
-`search_backend_cooldown_seconds` 控制搜索后端在触发 403/429、反爬挑战或网络失败后的基础冷却时间，默认 `60` 秒；连续失败会指数退避，最高 300 秒。冷却期间会跳过该后端，优先尝试链路里的下一个后端。
+`search_backend_cooldown_seconds` 控制搜索后端在触发 403/429、反爬挑战、网络失败或解析不到预期结果结构后的基础冷却时间，默认 `60` 秒；连续失败会指数退避，最高 300 秒。冷却期间会跳过该后端，优先尝试链路里的下一个后端。`search_cooldown_empty_results` 默认为 `true`，用于把“页面返回 200 但没有解析出任何可用结果”视为疑似后端结构/反爬失败；如果你更希望冷门查询不触发冷却，可以设为 `false`。
 
 `allow_private_networks` 默认是 `false`。只建议在可信内网文档场景临时开启：
 

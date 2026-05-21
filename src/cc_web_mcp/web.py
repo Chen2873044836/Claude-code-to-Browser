@@ -323,6 +323,7 @@ class GlobalWebConfig:
     cache_ttl_seconds: int = 1_800
     search_cache_ttl_seconds: int = 300
     search_backend_cooldown_seconds: int = 60
+    search_cooldown_empty_results: bool = True
     search_parallel_enabled: bool = False
     search_parallel_max_backends: int = 2
     trust_tun_fake_ip_dns: bool = False
@@ -678,6 +679,7 @@ def load_config(path: str | Path | None = None) -> GlobalWebConfig:
         cache_ttl_seconds=_bounded_int(raw.get("cache_ttl_seconds"), 1_800, 0, 86_400),
         search_cache_ttl_seconds=_bounded_int(raw.get("search_cache_ttl_seconds"), 300, 0, 3_600),
         search_backend_cooldown_seconds=_bounded_int(raw.get("search_backend_cooldown_seconds"), 60, 0, 3_600),
+        search_cooldown_empty_results=bool(raw.get("search_cooldown_empty_results", True)),
         search_parallel_enabled=bool(raw.get("search_parallel_enabled", False)),
         search_parallel_max_backends=_bounded_int(raw.get("search_parallel_max_backends"), 2, 1, 5),
         trust_tun_fake_ip_dns=bool(raw.get("trust_tun_fake_ip_dns", False)),
@@ -715,6 +717,7 @@ def config_to_dict(config: GlobalWebConfig) -> dict[str, Any]:
         "cache_ttl_seconds": config.cache_ttl_seconds,
         "search_cache_ttl_seconds": config.search_cache_ttl_seconds,
         "search_backend_cooldown_seconds": config.search_backend_cooldown_seconds,
+        "search_cooldown_empty_results": config.search_cooldown_empty_results,
         "search_parallel_enabled": config.search_parallel_enabled,
         "search_parallel_max_backends": config.search_parallel_max_backends,
         "trust_tun_fake_ip_dns": config.trust_tun_fake_ip_dns,
@@ -1544,9 +1547,9 @@ def _search_backend_cooldown_status(backend: str) -> dict[str, Any] | None:
     }
 
 
-def _should_cooldown_search_error(exc: Exception) -> bool:
+def _should_cooldown_search_error(exc: Exception, config: GlobalWebConfig | Any) -> bool:
     if isinstance(exc, EmptySearchResultsError):
-        return False
+        return bool(_cfg(config, "search_cooldown_empty_results", True))
     if isinstance(exc, SearchBackendUnavailableError):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
@@ -1556,7 +1559,7 @@ def _should_cooldown_search_error(exc: Exception) -> bool:
 
 
 def _record_search_backend_failure(backend: str, exc: Exception, config: GlobalWebConfig | Any) -> int | None:
-    if not _should_cooldown_search_error(exc):
+    if not _should_cooldown_search_error(exc, config):
         return None
     base_seconds = _bounded_int(_cfg(config, "search_backend_cooldown_seconds", 60), 60, 0, 3_600)
     if base_seconds <= 0:

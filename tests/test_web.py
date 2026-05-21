@@ -715,6 +715,74 @@ def test_search_web_falls_back_when_provider_returns_empty_results(monkeypatch):
     assert result["results"][0]["url"] == "https://docs.python.org/3/"
 
 
+def test_search_web_cools_down_backend_when_html_structure_is_unparseable(monkeypatch):
+    class Config:
+        search_provider = "bing"
+        search_providers = ("bing", "bing_cn")
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 90
+        search_cooldown_empty_results = True
+
+    web._SEARCH_BACKEND_COOLDOWNS.clear()
+    calls = []
+    now = time.time()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            calls.append(url)
+            if url == "https://www.bing.com/search":
+                return httpx.Response(
+                    200,
+                    text="<html><body><main>No b_algo results</main></body></html>",
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <li class="b_algo">
+                    <h2><a href="https://example.com/fallback">Fallback</a></h2>
+                    <p>fallback snippet</p>
+                  </li>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(web.time, "time", lambda: now)
+
+    first = asyncio.run(web.search_web("mcp docs", max_results=2, config=Config()))
+    second = asyncio.run(web.search_web("mcp docs again", max_results=2, config=Config()))
+
+    assert first["backend"] == "bing_cn"
+    assert first["attempted_backends"][0]["backend"] == "bing"
+    assert first["attempted_backends"][0]["cooldown_seconds"] == 90
+    assert second["backend"] == "bing_cn"
+    assert second["attempted_backends"][0]["backend"] == "bing"
+    assert second["attempted_backends"][0]["skipped"] is True
+    assert second["attempted_backends"][0]["retry_after_seconds"] == 90
+    assert calls == [
+        "https://www.bing.com/search",
+        "https://cn.bing.com/search",
+        "https://cn.bing.com/search",
+    ]
+
+    web._SEARCH_BACKEND_COOLDOWNS.clear()
+
+
 def test_search_web_falls_back_when_duckduckgo_returns_js_challenge(monkeypatch):
     class Config:
         search_provider = "duckduckgo"
