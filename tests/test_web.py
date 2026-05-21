@@ -782,6 +782,81 @@ def test_search_web_retries_provider_when_comparison_query_drifts(monkeypatch):
     assert result["results"][0]["url"] == "https://zhuanlan.zhihu.com/p/redis"
 
 
+def test_search_web_falls_back_when_query_retry_still_low_relevance(monkeypatch):
+    class Config:
+        search_provider = "bing_cn"
+        search_providers = ("bing_cn", "duckduckgo")
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = True
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+        search_parallel_enabled = False
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            calls.append(("GET", url, params["q"]))
+            if "bing.com" in url:
+                return httpx.Response(
+                    200,
+                    text="""
+                    <html><body>
+                      <li class="b_algo">
+                        <h2><a href="https://www.mysql.com/cn/">MySQL</a></h2>
+                        <p>MySQL official site.</p>
+                      </li>
+                      <li class="b_algo">
+                        <h2><a href="https://www.runoob.com/mysql/mysql-tutorial.html">MySQL 教程</a></h2>
+                        <p>MySQL 安装教程。</p>
+                      </li>
+                    </body></html>
+                    """,
+                    request=httpx.Request("GET", url),
+                )
+            raise AssertionError(f"unexpected GET {url}")
+
+        async def post(self, url, data=None, follow_redirects=True):
+            calls.append(("POST", url, data["q"]))
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <a class="result__a" href="https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html">
+                    MySQL InnoDB Multi-Versioning
+                  </a>
+                  <a class="result__snippet">InnoDB MVCC transaction isolation undo log.</a>
+                </body></html>
+                """,
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(
+        web.search_web(
+            "MySQL InnoDB MVCC undo log redo log transaction isolation",
+            max_results=3,
+            config=Config(),
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["backend"] == "duckduckgo_html"
+    assert result["fallback_reason"].startswith("bing_cn failed: LowRelevanceSearchResultsError")
+    assert result["results"][0]["url"] == "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
+
+
 def test_short_search_retry_query_preserves_vs_comparison():
     assert (
         web._short_search_retry_query("Redis cluster vs sentinel high availability comparison 2025")

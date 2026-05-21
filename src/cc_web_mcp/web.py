@@ -40,7 +40,7 @@ REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
 DEFAULT_CONFIG_PATH = resolve_config_path()
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "cc-web-mcp"
 CACHE_SCHEMA_VERSION = 3
-SEARCH_CACHE_SCHEMA_VERSION = 5
+SEARCH_CACHE_SCHEMA_VERSION = 6
 BROWSE_REF_TTL_SECONDS = 1_800
 MAX_BROWSE_REFS = 200
 BING_CN_SCOPE_NOTE = "bing_cn may be region-biased and is used as fallback; it is not equivalent to full global search."
@@ -161,6 +161,10 @@ class FetchDiagnosticError(FetchSafetyError):
 
 
 class EmptySearchResultsError(RuntimeError):
+    pass
+
+
+class LowRelevanceSearchResultsError(RuntimeError):
     pass
 
 
@@ -2684,7 +2688,10 @@ async def _retry_provider_with_short_query_if_needed(
             "original_score": original_score,
             "retry_score": retry_score,
         }
-    return backend, results, None
+    raise LowRelevanceSearchResultsError(
+        f"low_relevance_results: query={provider_query!r}, retry_query={retry_query!r}, "
+        f"original_score={original_score}, retry_score={retry_score}"
+    )
 
 
 def _exact_search_result(candidates: list[dict[str, Any]], safe_url: str) -> dict[str, Any] | None:
