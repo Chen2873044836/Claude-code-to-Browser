@@ -693,6 +693,13 @@ def test_search_web_retries_provider_with_short_query_when_long_query_drifts(mon
     assert result["results"][0]["url"] == "https://raft.github.io/"
 
 
+def test_short_search_retry_query_preserves_vs_comparison():
+    assert (
+        web._short_search_retry_query("Redis cluster vs sentinel high availability comparison 2025")
+        == "redis cluster vs sentinel"
+    )
+
+
 def test_search_web_default_chain_prefers_international_bing_before_bing_cn(monkeypatch):
     class Config:
         search_provider = "duckduckgo"

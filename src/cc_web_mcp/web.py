@@ -40,7 +40,7 @@ REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
 DEFAULT_CONFIG_PATH = resolve_config_path()
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "cc-web-mcp"
 CACHE_SCHEMA_VERSION = 3
-SEARCH_CACHE_SCHEMA_VERSION = 4
+SEARCH_CACHE_SCHEMA_VERSION = 5
 BROWSE_REF_TTL_SECONDS = 1_800
 MAX_BROWSE_REFS = 200
 BING_CN_SCOPE_NOTE = "bing_cn may be region-biased and is used as fallback; it is not equivalent to full global search."
@@ -1540,16 +1540,20 @@ SEARCH_QUERY_STOPWORDS = {
     "performance",
     "the",
     "tutorial",
-    "vs",
     "what",
     "with",
 }
+SEARCH_QUERY_COMPARISON_TERMS = {"vs", "versus"}
 
 
 def _search_query_terms(query: str) -> list[str]:
     terms: list[str] = []
     for raw in re.findall(r"[\w.+#-]+", query.lower()):
         term = raw.strip("._-")
+        if term in SEARCH_QUERY_COMPARISON_TERMS:
+            if term not in terms:
+                terms.append(term)
+            continue
         if len(term) < 3 or term in SEARCH_QUERY_STOPWORDS:
             continue
         if term not in terms:
@@ -1561,7 +1565,12 @@ def _short_search_retry_query(query: str) -> str | None:
     terms = _search_query_terms(query)
     if len(terms) < 5:
         return None
-    short_terms = terms[:3]
+    short_length = 3
+    for index, term in enumerate(terms[:4]):
+        if term in SEARCH_QUERY_COMPARISON_TERMS and index + 1 < len(terms):
+            short_length = max(short_length, index + 2)
+            break
+    short_terms = terms[:short_length]
     short_query = " ".join(short_terms)
     if short_query and short_query != query.lower():
         return short_query
