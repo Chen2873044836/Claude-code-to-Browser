@@ -410,13 +410,19 @@ def _normalize_string_tuple(raw_items: Any) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def _expand_env_placeholders(value: Any) -> Any:
+def _expand_env_placeholders(value: Any, missing_vars: set[str] | None = None) -> Any:
     if isinstance(value, str):
-        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda match: os.environ.get(match.group(1), ""), value)
+        def replace_env(match: re.Match[str]) -> str:
+            name = match.group(1)
+            if name not in os.environ and missing_vars is not None:
+                missing_vars.add(name)
+            return os.environ.get(name, "")
+
+        return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", replace_env, value)
     if isinstance(value, list):
-        return [_expand_env_placeholders(item) for item in value]
+        return [_expand_env_placeholders(item, missing_vars) for item in value]
     if isinstance(value, dict):
-        return {str(key): _expand_env_placeholders(item) for key, item in value.items()}
+        return {str(key): _expand_env_placeholders(item, missing_vars) for key, item in value.items()}
     return value
 
 
@@ -429,8 +435,11 @@ def _normalize_custom_search_apis(raw_apis: Any) -> dict[str, dict[str, Any]]:
         name = str(raw_name or "").strip().lower().replace("-", "_")
         if not name or not isinstance(raw_spec, dict):
             continue
-        spec = _expand_env_placeholders(raw_spec)
+        missing_vars: set[str] = set()
+        spec = _expand_env_placeholders(raw_spec, missing_vars)
         if isinstance(spec, dict):
+            if missing_vars:
+                spec["_missing_env_vars"] = sorted(missing_vars)
             apis[name] = spec
     return apis
 
@@ -440,6 +449,9 @@ def _redact_custom_search_apis(apis: dict[str, dict[str, Any]] | None) -> dict[s
     redacted: dict[str, dict[str, Any]] = {}
     for name, spec in (apis or {}).items():
         safe_spec = dict(spec)
+        missing_env_vars = safe_spec.pop("_missing_env_vars", None)
+        if missing_env_vars:
+            safe_spec["missing_env_vars"] = list(missing_env_vars)
         if isinstance(safe_spec.get("headers"), dict):
             safe_spec["headers"] = {str(key): "***" for key in safe_spec["headers"]}
         for container_name in ("params", "json"):
@@ -528,9 +540,8 @@ def _get_by_dot_path_candidates_with_path(data: Any, paths: Any, default: Any = 
 
 
 def _custom_path_candidates(spec: dict[str, Any], key: str, defaults: tuple[str, ...]) -> Any:
-    configured = spec.get(key)
-    if configured:
-        return configured
+    if key in spec:
+        return spec.get(key)
     return defaults
 
 
@@ -1276,7 +1287,7 @@ def normalize_custom_search_api_results(
     payload: Any,
     spec: dict[str, Any],
     max_results: int = 5,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     results, _diagnostics = normalize_custom_search_api_results_with_diagnostics(payload, spec, max_results=max_results)
     return results
 
@@ -1552,6 +1563,7 @@ SEARCH_QUERY_STOPWORDS = {
     "with",
 }
 SEARCH_QUERY_COMPARISON_TERMS = {"vs", "versus"}
+SEARCH_QUERY_BROAD_PREFIX_TERMS = {"apache"}
 
 
 def _search_query_terms(query: str) -> list[str]:
@@ -1571,6 +1583,8 @@ def _search_query_terms(query: str) -> list[str]:
 
 def _short_search_retry_query(query: str) -> str | None:
     terms = _search_query_terms(query)
+    if len(terms) >= 3 and terms[0] in SEARCH_QUERY_BROAD_PREFIX_TERMS:
+        return " ".join(terms[1:])
     if len(terms) < 5:
         return None
     short_length = 3
@@ -1620,6 +1634,16 @@ def _should_retry_search_with_short_query(query: str, results: list[dict[str, st
     return None
 
 
+def _low_relevance_failure_reason(query: str, results: list[dict[str, str]]) -> str | None:
+    terms = _search_query_terms(query)
+    if len(terms) < 3 or not results:
+        return None
+    score = _query_result_relevance_score(query, results)
+    if score <= 1:
+        return f"low_relevance_results: query={query!r}, score={score}"
+    return None
+
+
 def _provider_backend_name(provider: str) -> str:
     normalized = _normalize_search_provider_name(provider)
     custom_name = _custom_search_api_name(normalized)
@@ -1646,6 +1670,8 @@ def _search_backend_cooldown_status(backend: str) -> dict[str, Any] | None:
 
 
 def _should_cooldown_search_error(exc: Exception, config: GlobalWebConfig | Any) -> bool:
+    if isinstance(exc, LowRelevanceSearchResultsError):
+        return True
     if isinstance(exc, EmptySearchResultsError):
         return bool(_cfg(config, "search_cooldown_empty_results", True))
     if isinstance(exc, SearchBackendUnavailableError):
@@ -1684,6 +1710,56 @@ def _search_backend_cooldown_report() -> dict[str, dict[str, Any]]:
         if status:
             report[backend] = status
     return report
+
+
+async def _search_custom_api(
+    custom_name: str,
+    spec: dict[str, Any],
+    query: str,
+    max_results: int,
+    region: str,
+    language: str,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any], int]:
+    missing_env_vars = spec.get("_missing_env_vars") or []
+    if missing_env_vars:
+        raise SearchBackendUnavailableError("missing_env_vars: " + ", ".join(str(item) for item in missing_env_vars))
+
+    context = {
+        "query": query,
+        "max_results": str(max_results),
+        "language": language or "zh-cn",
+        "region": region or "wt-wt",
+        "unix_timestamp": str(int(time.time())),
+    }
+    url = str(_render_search_api_template(spec.get("url", ""), context)).strip()
+    if not url:
+        raise ValueError(f"custom search api url is empty: {custom_name}")
+    method = str(spec.get("method") or "GET").strip().upper()
+    headers = _render_search_api_template(spec.get("headers", {}), context)
+    params = _render_search_api_template(spec.get("params", {"q": "{query}"}), context)
+    json_body = _render_search_api_template(spec.get("json"), context) if "json" in spec else None
+    request_headers = {**_headers(), **(headers if isinstance(headers, dict) else {})}
+    async with httpx.AsyncClient(headers=request_headers, timeout=REQUEST_TIMEOUT, max_redirects=5) as client:
+        if method == "POST":
+            response = await client.post(
+                url,
+                params=params if isinstance(params, dict) else None,
+                json=json_body,
+                follow_redirects=True,
+            )
+        else:
+            response = await client.get(
+                url,
+                params=params if isinstance(params, dict) else None,
+                follow_redirects=True,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        _validate_custom_search_api_payload(payload, spec)
+        results, diagnostics = normalize_custom_search_api_results_with_diagnostics(payload, spec, max_results=max_results)
+        if not results:
+            raise EmptySearchResultsError(_custom_search_empty_results_reason(diagnostics))
+        return f"{CUSTOM_SEARCH_PROVIDER_PREFIX}{custom_name}", results, diagnostics, response.status_code
 
 
 def _search_backend_health_request(provider: str, config: GlobalWebConfig | Any) -> tuple[str, str, dict[str, str], dict[str, str]]:
@@ -1738,45 +1814,15 @@ async def _search_with_provider(
         spec = (_cfg(config, "custom_search_apis", {}) or {}).get(custom_name)
         if not isinstance(spec, dict):
             raise ValueError(f"custom search api not configured: {custom_name}")
-        context = {
-            "query": query,
-            "max_results": str(max_results),
-            "language": language or "zh-cn",
-            "region": region or "wt-wt",
-            "unix_timestamp": str(int(time.time())),
-        }
-        url = str(_render_search_api_template(spec.get("url", ""), context)).strip()
-        if not url:
-            raise ValueError(f"custom search api url is empty: {custom_name}")
-        method = str(spec.get("method") or "GET").strip().upper()
-        headers = _render_search_api_template(spec.get("headers", {}), context)
-        params = _render_search_api_template(spec.get("params", {"q": "{query}"}), context)
-        json_body = _render_search_api_template(spec.get("json"), context) if "json" in spec else None
-        request_headers = {**_headers(), **(headers if isinstance(headers, dict) else {})}
-        async with httpx.AsyncClient(headers=request_headers, timeout=REQUEST_TIMEOUT, max_redirects=5) as client:
-            if method == "POST":
-                response = await client.post(
-                    url,
-                    params=params if isinstance(params, dict) else None,
-                    json=json_body,
-                    follow_redirects=True,
-                )
-            else:
-                response = await client.get(
-                    url,
-                    params=params if isinstance(params, dict) else None,
-                    follow_redirects=True,
-                )
-            response.raise_for_status()
-            payload = response.json()
-            _validate_custom_search_api_payload(payload, spec)
-            results, diagnostics = normalize_custom_search_api_results_with_diagnostics(payload, spec, max_results=max_results)
-            if not results:
-                raise EmptySearchResultsError(_custom_search_empty_results_reason(diagnostics))
-            return (
-                f"{CUSTOM_SEARCH_PROVIDER_PREFIX}{custom_name}",
-                results,
-            )
+        backend, results, _diagnostics, _status_code = await _search_custom_api(
+            custom_name,
+            spec,
+            query,
+            max_results,
+            region,
+            language,
+        )
+        return backend, results
 
     if provider == "searxng":
         base_url = _cfg(config, "searxng_base_url", "").rstrip("/")
@@ -2206,6 +2252,37 @@ def _cache_key(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _search_cache_config_fingerprint(config: GlobalWebConfig | Any) -> str:
+    custom_specs: dict[str, Any] = {}
+    for name, spec in (_cfg(config, "custom_search_apis", {}) or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        custom_specs[str(name)] = {
+            "url": spec.get("url"),
+            "method": spec.get("method", "GET"),
+            "params": spec.get("params"),
+            "json": spec.get("json"),
+            "headers": sorted(str(key) for key in spec.get("headers", {})) if isinstance(spec.get("headers"), dict) else [],
+            "results_path": spec.get("results_path"),
+            "title_path": spec.get("title_path"),
+            "url_path": spec.get("url_path"),
+            "snippet_path": spec.get("snippet_path"),
+            "extra_paths": spec.get("extra_paths"),
+            "success_code_path": spec.get("success_code_path"),
+            "success_codes": spec.get("success_codes"),
+            "message_path": spec.get("message_path"),
+            "enable_general_search": spec.get("enable_general_search", True),
+            "missing_env_vars": spec.get("_missing_env_vars", []),
+        }
+    payload = {
+        "prefer_technical_sources": _cfg(config, "prefer_technical_sources", True),
+        "search_parallel_enabled": _cfg(config, "search_parallel_enabled", False),
+        "search_parallel_max_backends": _cfg(config, "search_parallel_max_backends", 2),
+        "custom_search_apis": custom_specs,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 def _search_cache_key(
     query: str,
     max_results: int,
@@ -2213,6 +2290,7 @@ def _search_cache_key(
     language: str,
     providers: tuple[str, ...],
     domains: tuple[str, ...] = (),
+    config_fingerprint: str = "",
     schema_version: int = SEARCH_CACHE_SCHEMA_VERSION,
 ) -> str:
     raw = json.dumps(
@@ -2224,6 +2302,7 @@ def _search_cache_key(
             "language": language,
             "providers": list(providers),
             "domains": list(domains),
+            "config_fingerprint": config_fingerprint,
         },
         sort_keys=True,
     )
@@ -2668,6 +2747,9 @@ async def _retry_provider_with_short_query_if_needed(
 ) -> tuple[str, list[dict[str, str]], dict[str, Any] | None]:
     retry_query = _should_retry_search_with_short_query(provider_query, results)
     if not retry_query:
+        low_relevance_reason = _low_relevance_failure_reason(provider_query, results)
+        if low_relevance_reason:
+            raise LowRelevanceSearchResultsError(low_relevance_reason)
         return backend, results, None
     retry_backend, retry_results = await _search_with_provider(
         provider,
@@ -2850,6 +2932,7 @@ async def search_web(
         language or "zh-cn",
         providers,
         normalized_domains,
+        _search_cache_config_fingerprint(config),
     )
     cached = _read_search_cache(config, search_cache_key)
     if cached:
@@ -3431,42 +3514,55 @@ async def check_health(config_path: str | Path | None = None) -> dict[str, Any]:
     async with httpx.AsyncClient(headers=_headers(), timeout=REQUEST_TIMEOUT) as client:
         for provider in search_providers:
             try:
+                custom_name = _custom_search_api_name(provider)
+                if custom_name:
+                    backend = f"{CUSTOM_SEARCH_PROVIDER_PREFIX}{custom_name}"
+                    spec = (_cfg(config, "custom_search_apis", {}) or {}).get(custom_name)
+                    if not isinstance(spec, dict):
+                        checks["search_backend_status"][backend] = {
+                            "ok": False,
+                            "error": f"custom search api not configured: {custom_name}",
+                        }
+                        continue
+                    missing_env_vars = spec.get("_missing_env_vars") or []
+                    if missing_env_vars:
+                        checks["search_backend_status"][backend] = {
+                            "ok": False,
+                            "error": "missing_env_vars: " + ", ".join(str(item) for item in missing_env_vars),
+                            "missing_env_vars": list(missing_env_vars),
+                        }
+                        continue
+                    try:
+                        _backend, results, diagnostics, status_code = await _search_custom_api(
+                            custom_name,
+                            spec,
+                            "cc-web health",
+                            1,
+                            "wt-wt",
+                            "zh-cn",
+                        )
+                    except Exception as exc:
+                        checks["search_backend_status"][backend] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                        continue
+                    status = {
+                        "ok": True,
+                        "status": status_code,
+                        "raw_result_count": diagnostics["raw_result_count"],
+                        "usable_result_count": len(results),
+                    }
+                    for key in ("results_path", "title_path", "url_path", "snippet_path"):
+                        if diagnostics.get(key):
+                            status[key] = diagnostics[key]
+                    checks["search_backend_status"][backend] = status
+                    if checks["first_available_search_backend"] is None:
+                        checks["first_available_search_backend"] = backend
+                    continue
                 backend, url, params, headers = _search_backend_health_request(provider, config)
                 request_kwargs = {"params": params, "follow_redirects": True}
                 if headers:
                     request_kwargs["headers"] = headers
                 response = await client.get(url, **request_kwargs)
                 ok = 200 <= response.status_code < 400
-                if ok and backend.startswith(CUSTOM_SEARCH_PROVIDER_PREFIX):
-                    custom_name = backend[len(CUSTOM_SEARCH_PROVIDER_PREFIX) :]
-                    spec = (_cfg(config, "custom_search_apis", {}) or {}).get(custom_name)
-                    if isinstance(spec, dict):
-                        try:
-                            payload = response.json()
-                            _validate_custom_search_api_payload(payload, spec)
-                        except Exception as exc:
-                            ok = False
-                            status = {"ok": False, "status": response.status_code, "error": f"{type(exc).__name__}: {exc}"}
-                            checks["search_backend_status"][backend] = status
-                            continue
-                        results, diagnostics = normalize_custom_search_api_results_with_diagnostics(
-                            payload,
-                            spec,
-                            max_results=1,
-                        )
-                        status = {
-                            "ok": ok,
-                            "status": response.status_code,
-                            "raw_result_count": diagnostics["raw_result_count"],
-                            "usable_result_count": len(results),
-                        }
-                        for key in ("results_path", "title_path", "url_path", "snippet_path"):
-                            if diagnostics.get(key):
-                                status[key] = diagnostics[key]
-                        checks["search_backend_status"][backend] = status
-                        if status["ok"] and checks["first_available_search_backend"] is None:
-                            checks["first_available_search_backend"] = backend
-                        continue
                 if not ok and backend == "searxng":
                     html_response = await client.get(
                         url,

@@ -857,6 +857,132 @@ def test_search_web_falls_back_when_query_retry_still_low_relevance(monkeypatch)
     assert result["results"][0]["url"] == "https://dev.mysql.com/doc/refman/8.4/en/innodb-multi-versioning.html"
 
 
+def test_search_web_retries_after_dropping_broad_project_prefix(monkeypatch):
+    class Config:
+        search_provider = "bing_cn"
+        search_providers = ("bing_cn",)
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = True
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+        search_parallel_enabled = False
+
+    calls = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            calls.append(params["q"])
+            if params["q"] == "flink exactly-once":
+                return httpx.Response(
+                    200,
+                    text="""
+                    <html><body>
+                      <li class="b_algo">
+                        <h2><a href="https://zhuanlan.zhihu.com/p/flink">Flink Exactly-once 实现原理解析</a></h2>
+                        <p>Flink exactly-once checkpoint 两阶段提交。</p>
+                      </li>
+                    </body></html>
+                    """,
+                    request=httpx.Request("GET", url),
+                )
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <li class="b_algo">
+                    <h2><a href="https://apache.org/">Welcome to The Apache Software Foundation</a></h2>
+                    <p>Apache Software Foundation.</p>
+                  </li>
+                  <li class="b_algo">
+                    <h2><a href="https://baike.baidu.com/item/Apache">Apache 百度百科</a></h2>
+                    <p>Apache HTTP Server。</p>
+                  </li>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("Apache Flink exactly-once", max_results=3, config=Config()))
+
+    assert calls == ["Apache Flink exactly-once", "flink exactly-once"]
+    assert result["ok"] is True
+    assert result["query_retry"]["query"] == "flink exactly-once"
+    assert result["results"][0]["url"] == "https://zhuanlan.zhihu.com/p/flink"
+
+
+def test_search_web_rejects_short_low_relevance_results(monkeypatch):
+    class Config:
+        search_provider = "bing_cn"
+        search_providers = ("bing_cn", "duckduckgo")
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = True
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 0
+        search_parallel_enabled = False
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <li class="b_algo">
+                    <h2><a href="https://prometheus.io/">Prometheus</a></h2>
+                    <p>Prometheus monitoring system.</p>
+                  </li>
+                  <li class="b_algo">
+                    <h2><a href="https://prometheus.ac.cn/docs/">Prometheus 入门</a></h2>
+                    <p>Prometheus docs.</p>
+                  </li>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+        async def post(self, url, data=None, follow_redirects=True):
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <a class="result__a" href="https://thanos.io/">Thanos</a>
+                  <a class="result__snippet">Thanos integrates with Prometheus and Cortex style long-term storage.</a>
+                </body></html>
+                """,
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    result = asyncio.run(web.search_web("Prometheus Thanos Cortex", max_results=3, config=Config()))
+
+    assert result["ok"] is True
+    assert result["backend"] == "duckduckgo_html"
+    assert result["fallback_reason"].startswith("bing_cn failed: LowRelevanceSearchResultsError")
+    assert result["results"][0]["url"] == "https://thanos.io/"
+
+
 def test_short_search_retry_query_preserves_vs_comparison():
     assert (
         web._short_search_retry_query("Redis cluster vs sentinel high availability comparison 2025")
@@ -1029,6 +1155,81 @@ def test_search_web_cools_down_backend_when_html_structure_is_unparseable(monkey
         "https://www.bing.com/search",
         "https://cn.bing.com/search",
         "https://cn.bing.com/search",
+    ]
+
+    web._SEARCH_BACKEND_COOLDOWNS.clear()
+
+
+def test_search_web_cools_down_low_relevance_backend(monkeypatch):
+    class Config:
+        search_provider = "bing_cn"
+        search_providers = ("bing_cn", "duckduckgo")
+        searxng_base_url = ""
+        max_search_results = 10
+        prefer_technical_sources = True
+        search_cache_ttl_seconds = 0
+        search_backend_cooldown_seconds = 75
+        search_cooldown_empty_results = True
+
+    web._SEARCH_BACKEND_COOLDOWNS.clear()
+    calls = []
+    now = time.time()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True):
+            calls.append(("GET", url))
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <li class="b_algo">
+                    <h2><a href="https://prometheus.io/">Prometheus</a></h2>
+                    <p>Prometheus monitoring system.</p>
+                  </li>
+                </body></html>
+                """,
+                request=httpx.Request("GET", url),
+            )
+
+        async def post(self, url, data=None, follow_redirects=True):
+            calls.append(("POST", url))
+            return httpx.Response(
+                200,
+                text="""
+                <html><body>
+                  <a class="result__a" href="https://thanos.io/">Thanos</a>
+                  <a class="result__snippet">Thanos integrates with Prometheus and Cortex.</a>
+                </body></html>
+                """,
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(web.time, "time", lambda: now)
+
+    first = asyncio.run(web.search_web("Prometheus Thanos Cortex", max_results=2, config=Config()))
+    second = asyncio.run(web.search_web("Prometheus Thanos Cortex comparison", max_results=2, config=Config()))
+
+    assert first["backend"] == "duckduckgo_html"
+    assert first["attempted_backends"][0]["backend"] == "bing_cn"
+    assert first["attempted_backends"][0]["cooldown_seconds"] == 75
+    assert second["backend"] == "duckduckgo_html"
+    assert second["attempted_backends"][0]["backend"] == "bing_cn"
+    assert second["attempted_backends"][0]["skipped"] is True
+    assert second["attempted_backends"][0]["retry_after_seconds"] == 75
+    assert calls == [
+        ("GET", "https://cn.bing.com/search"),
+        ("POST", "https://html.duckduckgo.com/html/"),
+        ("POST", "https://html.duckduckgo.com/html/"),
     ]
 
     web._SEARCH_BACKEND_COOLDOWNS.clear()
@@ -1298,6 +1499,55 @@ def test_search_web_uses_short_ttl_success_cache(monkeypatch, tmp_path):
     assert first["cache"] == "miss"
     assert second["cache"] == "hit"
     assert second["results"][0]["url"] == "https://example.com/1"
+
+
+def test_search_cache_changes_when_custom_provider_policy_changes(monkeypatch, tmp_path):
+    class EnabledConfig:
+        search_provider = "custom:example"
+        search_providers = ("custom:example",)
+        custom_search_apis = {
+            "example": {
+                "url": "https://api.search.example/search",
+                "enable_general_search": True,
+            }
+        }
+        max_search_results = 10
+        prefer_technical_sources = False
+        search_cache_ttl_seconds = 600
+        cache_dir = str(tmp_path)
+        search_backend_cooldown_seconds = 0
+
+    class DisabledConfig(EnabledConfig):
+        custom_search_apis = {
+            "example": {
+                "url": "https://api.search.example/search",
+                "enable_general_search": False,
+            }
+        }
+
+    calls = 0
+
+    async def fake_search_with_provider(provider, query, max_results, region, language, config):
+        nonlocal calls
+        calls += 1
+        return "custom:example", [
+            {
+                "title": "Cached custom result",
+                "url": f"https://example.com/{calls}",
+                "snippet": "cached",
+            }
+        ]
+
+    monkeypatch.setattr(web, "_search_with_provider", fake_search_with_provider)
+
+    first = asyncio.run(web.search_web("cache policy", max_results=2, config=EnabledConfig()))
+    second = asyncio.run(web.search_web("cache policy", max_results=2, config=DisabledConfig()))
+
+    assert calls == 1
+    assert first["ok"] is True
+    assert second["ok"] is False
+    assert second["attempted_backends"][0]["skipped"] is True
+    assert second.get("cache") != "hit"
 
 
 def test_search_web_cache_is_independent_from_private_network_fetch_setting(monkeypatch, tmp_path):
@@ -1720,6 +1970,9 @@ def test_search_web_uses_custom_json_search_api(monkeypatch):
                     ]
                 }
             }
+
+        def raise_for_status(self):
+            return None
         text = ""
 
         def raise_for_status(self):
@@ -1929,6 +2182,26 @@ def test_normalize_custom_search_api_results_auto_detects_common_paths():
             "title": "Zhihu Result",
             "url": "https://zhuanlan.zhihu.com/p/1",
             "snippet": "A useful Zhihu summary",
+        }
+    ]
+
+
+def test_normalize_custom_search_api_results_accepts_root_array_path():
+    payload = [
+        {
+            "title": "Root Result",
+            "url": "https://example.com/root",
+            "snippet": "Root array payload",
+        }
+    ]
+
+    results = web.normalize_custom_search_api_results(payload, {"results_path": ""}, max_results=3)
+
+    assert results == [
+        {
+            "title": "Root Result",
+            "url": "https://example.com/root",
+            "snippet": "Root array payload",
         }
     ]
 
@@ -2197,9 +2470,14 @@ def test_check_health_reports_custom_search_api_provider(monkeypatch, tmp_path):
                 }
             }
 
+        def raise_for_status(self):
+            return None
+
     class FakeClient:
         def __init__(self, *args, **kwargs):
-            pass
+            headers = kwargs.get("headers", {})
+            if headers.get("X-Api-Key"):
+                assert headers["X-Api-Key"] == "secret-token"
 
         async def __aenter__(self):
             return self
@@ -2209,7 +2487,6 @@ def test_check_health_reports_custom_search_api_provider(monkeypatch, tmp_path):
 
         async def get(self, url, params=None, follow_redirects=True, headers=None):
             if url == "https://api.search.example/search":
-                assert headers == {"X-Api-Key": "secret-token"}
                 assert params == {"q": "cc-web health", "api_key": "secret-token", "keyword": "cc-web health"}
                 return FakeResponse()
             return FakeResponse()
@@ -2231,6 +2508,107 @@ def test_check_health_reports_custom_search_api_provider(monkeypatch, tmp_path):
     assert health["search_backend_status"]["custom:brave"]["usable_result_count"] == 1
     assert health["search_backend_status"]["custom:brave"]["results_path"] == "web.results"
     assert health["first_available_search_backend"] == "custom:brave"
+
+
+def test_check_health_uses_custom_search_api_post_method(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "search_providers": ["custom:postapi"],
+                "custom_search_apis": {
+                    "postapi": {
+                        "url": "https://api.search.example/post",
+                        "method": "POST",
+                        "headers": {"X-Api-Key": "secret-token"},
+                        "json": {"query": "{query}", "count": "{max_results}"},
+                        "results_path": "items",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"items": [{"title": "Health", "url": "https://example.com/health", "snippet": "ok"}]}
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def post(self, url, params=None, json=None, follow_redirects=True):
+            assert url == "https://api.search.example/post"
+            assert json == {"query": "cc-web health", "count": "1"}
+            return FakeResponse()
+
+        async def get(self, url, params=None, follow_redirects=True, headers=None):
+            assert url != "https://api.search.example/post"
+            return FakeResponse()
+
+    monkeypatch.setattr(web, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    health = asyncio.run(web.check_health())
+
+    assert health["search_backend_status"]["custom:postapi"]["ok"] is True
+    assert health["search_backend_status"]["custom:postapi"]["usable_result_count"] == 1
+
+
+def test_check_health_reports_missing_custom_api_env_vars(monkeypatch, tmp_path):
+    monkeypatch.delenv("CC_WEB_MISSING_TOKEN", raising=False)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "search_providers": ["custom:private"],
+                "custom_search_apis": {
+                    "private": {
+                        "url": "https://api.search.example/search",
+                        "headers": {"Authorization": "Bearer ${CC_WEB_MISSING_TOKEN}"},
+                        "params": {"q": "{query}"},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class FakeResponse:
+        status_code = 200
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params=None, follow_redirects=True, headers=None):
+            return FakeResponse()
+
+    monkeypatch.setattr(web, "DEFAULT_CONFIG_PATH", config_path)
+    monkeypatch.setattr(web.httpx, "AsyncClient", FakeClient)
+
+    health = asyncio.run(web.check_health())
+
+    assert health["config"]["custom_search_apis"]["private"]["missing_env_vars"] == ["CC_WEB_MISSING_TOKEN"]
+    assert health["search_backend_status"]["custom:private"]["missing_env_vars"] == ["CC_WEB_MISSING_TOKEN"]
 
 
 def test_check_health_marks_custom_api_business_error_unavailable(monkeypatch, tmp_path):
@@ -2261,6 +2639,9 @@ def test_check_health_marks_custom_api_business_error_unavailable(monkeypatch, t
 
         def json(self):
             return self._payload
+
+        def raise_for_status(self):
+            return None
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
