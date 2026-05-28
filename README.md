@@ -1,143 +1,104 @@
-# CC Web MCP
+# CC-Web-MCP（优化版）
 
-CC Web MCP 是一个面向 Claude Code 第三方模型接入场景的轻量网页搜索和抓取 MCP。
+> 基于 [JcDizzy/CC-Web-MCP](https://github.com/JcDizzy/CC-Web-MCP) 的优化版本，已提交 PR 至原仓库。
 
-它的主要用途是：当 Claude Code 接入 DeepSeek、Qwen、Kimi 等没有官方 `WebSearch` / `WebFetch` 能力的模型时，补上可访问国内外公开网页的只读工具链。官方 Claude 模型仍建议使用 Claude Code 原生搜索能力。
+## 这是什么
 
-## 功能概览
+CC-Web-MCP 是一个为 **Claude Code** 设计的本地网页搜索和抓取 MCP 工具链。
 
-- `web_search`：按配置的搜索后端顺序搜索公开网页，默认 `duckduckgo -> bing -> bing_cn`，可选 `searxng` / `mojeek` / `custom:<name>`。
-- `fetch_url`：抓取 `http/https` 页面并转为 Markdown，支持 `start_index` 分页读取。
-- `research_brief`：先搜索，再抓取少量来源的短内容，减少上下文占用。
-- `health_check`：检查依赖、配置和网络连通性。
-- 模型路由：通过 `allowed_model_patterns`、启动指令和 hook 守卫，让 DeepSeek、Qwen、Kimi 等第三方模型优先走 cc-web，官方 Claude 默认继续走原生 `WebSearch/WebFetch`。
-- 安全边界：默认禁止抓取本机、内网、链路本地地址和云 metadata 地址，并检查 DNS 解析和重定向后的最终 URL。
+**解决的问题：** 当 Claude Code 接入 DeepSeek、Qwen、Kimi 等第三方模型时，这些模型没有官方的 WebSearch/WebFetch 能力，无法联网。CC-Web-MCP 补上了这个缺口，让第三方模型也能搜索网页、抓取内容。
 
-## 快速开始
+**核心功能：**
+- `web_search` - 搜索公开网页
+- `fetch_url` - 抓取网页内容并转为 Markdown
+- `research_brief` - 快速调研工具，搜索并提取关键摘要
+- `health_check` - 检查依赖和网络连通性
 
-普通用户推荐直接用 `uvx` 从 PyPI 运行，不需要克隆仓库，也不需要提前创建虚拟环境：
+## 快速上手
 
-```powershell
+### 安装（推荐方式）
+
+```bash
 uvx cc-web-mcp init --runner uvx
+```
+
+### 验证安装
+
+```bash
 uvx cc-web-mcp doctor
 ```
 
-`--runner uvx` 是推荐写法：它会让 Claude Code 的 MCP server 配置长期指向稳定的 `uvx cc-web-mcp@<当前版本>`，而不是某个临时缓存目录或本地开发环境里的 Python。hook 守卫会单独使用 exec form 的 `uvx --from cc-web-mcp@<当前版本> cc-web-mcp hook-guard`，便于可靠传递 `--state` / `--config` 等参数。
+### 在 Claude Code 中使用
 
-如果之前已经用普通 `pip`、editable install 或旧的 uv 缓存路径初始化过，切换到 `uvx` 后请重新运行：
+安装完成后重启 Claude Code，直接使用：
 
-```powershell
-uvx cc-web-mcp init --runner uvx --force
+```
+使用 cc-web 搜索 "某个技术问题"
 ```
 
-首次初始化入口是 `init` 子命令。普通用户建议始终通过 `uvx cc-web-mcp init --runner uvx` 调用；只有 `pipx`、普通 `pip` 或 editable install 且命令已在 `PATH` 中时，才直接运行 `cc-web-mcp init`。初始化会：
+模型会自动调用 `mcp__cc-web__web_search` 或 `mcp__cc-web__research_brief`。
 
-- 创建用户配置文件。
-- 注册 Claude Code 用户级 stdio MCP。普通 Python 安装会注册为当前 Python 的 `-m cc_web_mcp`；`--runner uvx` 会注册为 `uvx cc-web-mcp@<当前版本>`。
-- 向用户级 `~\.claude\CLAUDE.md` 写入第三方模型路由提示。
-- 向用户级 `~\.claude\settings.json` 合并 hook 守卫，并在写入前备份。
+## 优化内容
 
-开发者需要改源码时，再使用 editable install：
+本版本在原版基础上做了以下优化：
 
-```powershell
-git clone https://github.com/JcDizzy/CC-Web-MCP.git <安装目录>
-cd <安装目录>
-py -3.11 -m pip install -e .
-py -3.11 -m cc_web_mcp init
-py -3.11 -m cc_web_mcp doctor
-```
+### 速度优化
 
-`pipx` 或普通 `pip` 也可以用，但不作为首选路径；如果 `pip install` 提示 `cc-web-mcp.exe` 所在目录不在 `PATH`，可以继续使用 `py -3.11 -m cc_web_mcp ...` 形式运行。
+| 优化项 | 原值 | 新值 | 效果 |
+|--------|------|------|------|
+| HTTP 超时 | 15 秒 | 8 秒 | 后端卡住时等待时间减半 |
+| 并行搜索 | 关闭 | 开启 | 同时请求 DuckDuckGo + Bing，速度翻倍 |
+| 搜索缓存 | 300 秒 | 600 秒 | 相同查询 10 分钟内直接返回缓存 |
+| 默认抓取字符 | 10000 | 15000 | 减少分页次数 |
 
-如果需要让 Claude Code 中长期注册的 uvx 命令支持 PDF 提取，初始化时加 `--with-pdf`：
+### 调用主动性优化
 
-```powershell
-uvx cc-web-mcp init --runner uvx --with-pdf --force
-```
+- **工具描述**：从"仅供第三方模型使用"改为正向功能说明，模型更愿意主动调用
+- **MCP 指令**：从"不要主动使用"改为"当需要获取最新信息时，应主动使用"
+- **CLAUDE.md 模板**：从英文否定指令改为中文正向引导
+- **Claude 可用 fetch_url**：默认允许官方 Claude 使用 `fetch_url`
 
-先看计划、不写文件：
+### 配套修复
 
-```powershell
-uvx cc-web-mcp init --runner uvx --dry-run
-```
+- 更新 doctor 检查逻辑，适配新的 CLAUDE.md 模板
+- 更新测试用例，全部 201 个测试通过
 
-非 `uvx` 安装且 `cc-web-mcp` 已在 `PATH` 中时，也可以用本地命令预览：
+## 原作者
 
-```powershell
-cc-web-mcp init --dry-run
-```
+- **原仓库**：[JcDizzy/CC-Web-MCP](https://github.com/JcDizzy/CC-Web-MCP)
+- **原作者**：[JcDizzy](https://github.com/JcDizzy)
+- **优化者**：[Chen2873044836](https://github.com/Chen2873044836)
+- **优化 PR**：[#3](https://github.com/JcDizzy/CC-Web-MCP/pull/3)
 
-如果只想初始化配置文件，普通用户继续使用 `uvx`：
+## 技术栈
 
-```powershell
-uvx cc-web-mcp config init
-uvx cc-web-mcp config path
-```
+- Python 3.11+
+- MCP (FastMCP) - MCP Server 框架
+- httpx - 异步 HTTP 客户端
+- beautifulsoup4 - HTML 解析
+- markdownify - HTML 转 Markdown
 
-非 `uvx` 安装且 `cc-web-mcp` 已在 `PATH` 中时，也可以写成：
+## 搜索后端
 
-```powershell
-cc-web-mcp config init
-cc-web-mcp config path
-```
+默认按顺序尝试：`DuckDuckGo → Bing → Bing_cn`
 
-## 基础配置
+支持自定义搜索 API、SearXNG、Mojeek 等。
 
-默认配置路径：
+## 安全特性
 
-- Windows：`%APPDATA%\cc-web-mcp\config.json`
-- macOS/Linux：`~/.config/cc-web-mcp/config.json`
-
-常用调整：
-
-- 同时适配更多第三方模型：`"allowed_model_patterns": ["deepseek", "qwen", "kimi"]`
-- DuckDuckGo 不稳定时只使用国际版 Bing：`"search_providers": ["bing"]`
-- 增加 Mojeek 作为轻量 fallback：`"search_providers": ["duckduckgo", "bing", "mojeek", "bing_cn"]`
-- 开启元搜索式并发聚合：`"search_parallel_enabled": true, "search_parallel_max_backends": 2`
-- 接入第三方或自建搜索 API：在 `search_providers` 中加入 `custom:<name>`，并在 `custom_search_apis` 里配置 URL、headers、params 和结果字段路径。
-- 调试自定义搜索 API：`cc-web-mcp config test-search custom:zhihu "deepseek" --max-results 3`
-- 抓取受限站点时定向使用搜索 API：开启 `enable_fetch_search_fallback`，并把 `fetch_search_fallback_providers` 指到 `custom:<name>`。
-- 某个第三方 API 的原生 Web 工具已经可用时：`"block_native_web_for_allowed_models": false`
-- 明确允许官方 Claude 调用 `cc-web fetch_url`：`"allow_fetch_url_for_claude": true`
-
-完整配置说明见 [docs/configuration.md](docs/configuration.md)。
-
-## 第一次验证建议
-
-安装完成后，建议先用第三方模型在 Claude Code 里做一次小范围联网任务：
-
-```text
-使用 cc-web 查询 “Claude Code MCP PreToolUse hook permissionDecision”，先用 research_brief 获取资料概览，再总结当前推荐写法。
-```
-
-如果模型仍尝试调用原生 `WebSearch`，先检查 `~\.claude\CLAUDE.md`。如果模型尝试调用原生 `WebFetch` 并被拦截，说明 hook 已生效；模型应根据提示改用 `cc-web fetch_url`。
-
-## 开发与测试
-
-```powershell
-py -3.11 -m pip install -e .
-py -3.11 -m pytest .\tests -q
-```
-
-构建发布包：
-
-```powershell
-py -3.11 -m build
-```
+- 默认禁止抓取内网地址
+- DNS 解析后二次校验 IP
+- 302 重定向后再次安全检查
+- 反爬检测和诊断
 
 ## 文档
 
 - [安装与验证](docs/installation.md)
 - [配置说明](docs/configuration.md)
-- [Claude Code 路由、Hook 与自动授权](docs/routing-and-permissions.md)
-- [工具能力与使用细节](docs/capabilities.md)
+- [路由与 Hook](docs/routing-and-permissions.md)
+- [工具能力](docs/capabilities.md)
 - [安全说明](docs/security.md)
-- [Roadmap](docs/roadmap.md)
 
-## 重要边界
+## License
 
-- `bing_cn` 是实用降级，不是全球搜索的等价替代。
-- `mojeek` 使用公开 HTML 搜索入口，适合轻量 fallback，不等价于付费搜索 API。
-- `WebSearch` 在部分第三方 Anthropic-compatible API 中会在服务端直接报错，Claude Code 本地 hook 拦截不到；需要依赖 `CLAUDE.md` 启动指令提前绕开。
-- 当前不包含 Playwright 或浏览器自动化，不处理重 JavaScript、登录墙、验证码页面。
-- 启用 Jina Reader fallback 时，目标 URL 会经过第三方服务；不要用于私密链接或内网页面。
+MIT
