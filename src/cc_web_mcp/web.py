@@ -36,7 +36,7 @@ SEARCH_USER_AGENTS = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
 )
 MAX_DOWNLOAD_BYTES = 5_000_000
-REQUEST_TIMEOUT = httpx.Timeout(15.0, connect=8.0, read=15.0)
+REQUEST_TIMEOUT = httpx.Timeout(8.0, connect=5.0, read=8.0)
 DEFAULT_CONFIG_PATH = resolve_config_path()
 DEFAULT_CACHE_DIR = Path.home() / ".cache" / "cc-web-mcp"
 CACHE_SCHEMA_VERSION = 3

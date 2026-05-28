@@ -108,7 +108,7 @@ def test_doctor_passes_when_local_files_are_configured(tmp_path):
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
-    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    claude_memory.write_text("Use cc-web MCP. Use mcp__cc-web__web_search for search.", encoding="utf-8")
     settings = tmp_path / "settings.json"
     hook_command = python_guard_command()
     settings.write_text(
@@ -157,7 +157,7 @@ def test_build_report_checks_claude_mcp_registration(tmp_path, monkeypatch):
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
-    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    claude_memory.write_text("Use cc-web MCP. Use mcp__cc-web__web_search for search.", encoding="utf-8")
     settings = tmp_path / "settings.json"
     hook_command = python_guard_command()
     settings.write_text(
@@ -242,7 +242,7 @@ def test_doctor_json_output_is_ascii_safe_for_windows_console(tmp_path, monkeypa
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
-    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    claude_memory.write_text("Use cc-web MCP. Use mcp__cc-web__web_search for search.", encoding="utf-8")
     settings = tmp_path / "settings.json"
     hook_command = python_guard_command()
     settings.write_text(
@@ -290,7 +290,7 @@ def test_doctor_fails_when_guard_is_only_registered_for_session_start(tmp_path):
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
-    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    claude_memory.write_text("Use cc-web MCP. Use mcp__cc-web__web_search for search.", encoding="utf-8")
     settings = tmp_path / "settings.json"
     settings.write_text(
         json.dumps(
@@ -326,7 +326,7 @@ def test_doctor_accepts_console_script_hook_guard(tmp_path):
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
-    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    claude_memory.write_text("Use cc-web MCP. Use mcp__cc-web__web_search for search.", encoding="utf-8")
     settings = tmp_path / "settings.json"
     hook_command = python_cli_guard_shell_command()
     settings.write_text(
@@ -359,7 +359,7 @@ def test_doctor_accepts_exec_form_hook_guard(tmp_path):
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
-    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    claude_memory.write_text("Use cc-web MCP. Use mcp__cc-web__web_search for search.", encoding="utf-8")
     settings = tmp_path / "settings.json"
     hook = {
         "type": "command",
@@ -395,7 +395,7 @@ def test_doctor_fails_when_registered_guard_command_cannot_run(tmp_path):
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
-    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    claude_memory.write_text("Use cc-web MCP. Use mcp__cc-web__web_search for search.", encoding="utf-8")
     settings = tmp_path / "settings.json"
     hook_command = f"{python_cli_guard_shell_command()} --definitely-invalid"
     settings.write_text(
@@ -432,7 +432,7 @@ def test_doctor_fails_when_pre_tool_matcher_does_not_cover_webfetch(tmp_path):
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
-    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    claude_memory.write_text("Use cc-web MCP. Use mcp__cc-web__web_search for search.", encoding="utf-8")
     settings = tmp_path / "settings.json"
     hook_command = python_guard_command()
     settings.write_text(
@@ -472,7 +472,7 @@ def test_build_report_runs_network_check_when_not_skipped(tmp_path, monkeypatch)
     config = tmp_path / "config.json"
     config.write_text('{"search_providers": ["duckduckgo", "bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
-    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    claude_memory.write_text("Use cc-web MCP. Use mcp__cc-web__web_search for search.", encoding="utf-8")
     settings = tmp_path / "settings.json"
     hook_command = python_guard_command()
     settings.write_text(
@@ -521,7 +521,7 @@ def test_build_report_passes_explicit_config_to_network_check(tmp_path, monkeypa
     config = tmp_path / "custom-config.json"
     config.write_text('{"search_providers": ["bing_cn"]}', encoding="utf-8")
     claude_memory = tmp_path / "CLAUDE.md"
-    claude_memory.write_text("Use cc-web MCP. Do not call WebSearch.", encoding="utf-8")
+    claude_memory.write_text("Use cc-web MCP. Use mcp__cc-web__web_search for search.", encoding="utf-8")
     settings = tmp_path / "settings.json"
     hook_command = python_guard_command()
     settings.write_text(

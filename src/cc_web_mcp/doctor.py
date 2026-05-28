@@ -67,7 +67,7 @@ def _check_claude_instructions(path: Path) -> tuple[dict[str, Any], list[str]]:
         return {"ok": False, "path": str(path), "error": "file missing"}, recommendations
 
     text = path.read_text(encoding="utf-8-sig", errors="replace")
-    ok = "cc-web" in text.lower() and "WebSearch" in text
+    ok = "cc-web" in text.lower() and "mcp__cc-web__" in text
     if not ok:
         recommendations.append("Run `cc-web-mcp init --force` to refresh cc-web routing hints.")
     return {"ok": ok, "path": str(path)}, recommendations

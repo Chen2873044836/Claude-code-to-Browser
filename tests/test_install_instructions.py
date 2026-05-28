@@ -27,10 +27,10 @@ def test_install_instructions_creates_user_memory_block(tmp_path):
     text = memory.read_text(encoding="utf-8")
     assert START_MARKER in text
     assert END_MARKER in text
-    assert "DeepSeek" in text
-    assert "Do not call WebSearch" in text
+    assert "cc-web MCP" in text
     assert "mcp__cc-web__research_brief" in text
     assert "mcp__cc-web__fetch_url" in text
+    assert "mcp__cc-web__web_search" in text
 
 
 def test_install_instructions_preserves_existing_content_and_is_idempotent(tmp_path):

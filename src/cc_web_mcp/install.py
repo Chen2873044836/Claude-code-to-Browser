@@ -293,15 +293,15 @@ def install_hooks(
 
 def replace_block(text: str) -> tuple[str, bool]:
     instruction_block = f"""{START_MARKER}
-## cc-web MCP routing for third-party models
+## cc-web MCP 联网工具
 
-When the current Claude Code model is DeepSeek, Qwen, Kimi, or another third-party model that lacks working native web tools:
+当需要获取最新信息、查阅文档、验证事实或收集参考资料时，应主动使用 cc-web MCP 工具：
 
-- Do not call WebSearch. Some third-party Anthropic-compatible APIs reject WebSearch before Claude Code local hooks can run.
-- For web research or current information, call `mcp__cc-web__research_brief` first.
-- If raw search results are needed, call `mcp__cc-web__web_search`.
-- If a specific URL must be read, call `mcp__cc-web__fetch_url`.
-- Official Claude models should continue to prefer native `WebSearch` / `WebFetch`.
+- 需要快速调研某个主题：使用 `mcp__cc-web__research_brief`，它会搜索并提取关键内容摘要
+- 需要查看具体网页内容：使用 `mcp__cc-web__fetch_url`
+- 需要原始搜索结果列表：使用 `mcp__cc-web__web_search`
+
+这些工具可以帮助你获取最新的技术文档、API 参考、代码示例和社区讨论。
 {END_MARKER}"""
 
     start = text.find(START_MARKER)

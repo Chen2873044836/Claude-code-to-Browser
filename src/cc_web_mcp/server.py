@@ -13,9 +13,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 mcp = FastMCP(
     "cc-web",
     instructions=(
-        "cc-web 主要用于 DeepSeek、Qwen、Kimi 等缺少 Claude Code 原生 WebSearch/WebFetch 能力的第三方模型。"
-        "官方 Claude 模型应优先使用内置 WebSearch/WebFetch，不要主动使用 cc-web。"
-        "只有用户显式要求 cc-web，或配置 allow_fetch_url_for_claude=true 时，官方 Claude 才可使用 fetch_url。"
+        "cc-web 提供网页搜索和抓取能力。当需要获取最新信息、查阅文档或验证事实时，应主动使用这些工具。"
+        "优先使用 research_brief 做快速调研，它会搜索并提取关键内容摘要。"
+        "如果需要完整网页内容，使用 fetch_url。"
+        "如果需要原始搜索结果列表，使用 web_search。"
     ),
 )
 
@@ -78,7 +79,7 @@ async def web_search(
     domains: list[str] | None = None,
     ctx: Context = None,
 ) -> str:
-    """仅供缺少原生 WebSearch 的第三方模型搜索公开网页；官方 Claude 应使用内置 WebSearch。"""
+    """搜索公开网页获取最新信息。当需要查阅文档、验证事实、了解最新进展或获取参考资料时使用此工具。"""
     result = await search_web(query, max_results, region, language, domains=domains, status_callback=_progress_callback(ctx))
     await _finish_progress(ctx)
     return to_json_text(result)
@@ -93,7 +94,7 @@ async def fetch_url(
     ref_id: str | None = None,
     ctx: Context = None,
 ) -> str:
-    """抓取 http/https URL 正文并转为 Markdown；官方 Claude 默认应使用内置 WebFetch，除非用户显式要求 cc-web 或配置允许。"""
+    """抓取网页内容并转换为 Markdown 格式。用于读取具体 URL 的完整内容，如文档页面、API 参考、技术文章等。"""
     result = await fetch_page(url, max_chars, start_index, extract_mode, ref_id=ref_id, status_callback=_progress_callback(ctx))
     await _finish_progress(ctx)
     return to_json_text(result)
@@ -109,7 +110,7 @@ async def research_brief(
     domains: list[str] | None = None,
     ctx: Context = None,
 ) -> str:
-    """仅供缺少原生 WebSearch/WebFetch 的第三方模型做上下文友好的资料概览；官方 Claude 应使用内置工具。"""
+    """快速调研工具：搜索并提取关键内容摘要。最适合需要快速了解某个主题、获取概览信息或收集多个来源要点时使用。"""
     result = await build_research_brief(
         query,
         max_sources,
